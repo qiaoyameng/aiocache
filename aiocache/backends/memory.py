@@ -48,9 +48,25 @@ class SimpleMemoryCache(BaseCache[str]):
 
         while len(self._cache) > self.maxsize:
             key, _ = self._cache.popitem(last=False)  # Remove LRU item
-            if key in self._handlers:
-                self._handlers[key].cancel()
-                del self._handlers[key]
+            self._cancel_handler(key)
+
+    def _cancel_handler(self, key: str) -> None:
+        handle = self._handlers.pop(key, None)
+        if handle is not None:
+            handle.cancel()
+
+    def _schedule_expiration(self, key: str, ttl: float) -> None:
+        loop = asyncio.get_running_loop()
+        holder: list[asyncio.TimerHandle] = []
+
+        def _on_expire(key=key, holder=holder):
+            # Only the generation of the entry that scheduled this timer may
+            # be removed by it, even if the callback was already queued for
+            # execution when the entry was overwritten/deleted/cleared.
+            self.__delete(key, expected_handle=holder[0])
+
+        holder.append(loop.call_later(ttl, _on_expire))
+        self._handlers[key] = holder[0]
 
     async def _get(self, key, encoding="utf-8", _conn=None):
         self._mark_accessed(key)
@@ -66,15 +82,13 @@ class SimpleMemoryCache(BaseCache[str]):
         if _cas_token is not None and self._cache.get(key) != _cas_token:
             return 0
 
-        if key in self._handlers:
-            self._handlers[key].cancel()
+        self._cancel_handler(key)
 
         self._cache[key] = value
         self._cache.move_to_end(key)
 
         if ttl:
-            loop = asyncio.get_running_loop()
-            self._handlers[key] = loop.call_later(ttl, self.__delete, key)
+            self._schedule_expiration(key, ttl)
 
         # Evict the oldest items if over limit
         self._evict_if_needed()
@@ -108,14 +122,10 @@ class SimpleMemoryCache(BaseCache[str]):
         if key not in self._cache:
             return False
 
-        # Cancel existing timer
-        if key in self._handlers:
-            self._handlers[key].cancel()
+        self._cancel_handler(key)
 
-        # Set new timer
         if ttl:
-            loop = asyncio.get_running_loop()
-            self._handlers[key] = loop.call_later(ttl, self.__delete, key)
+            self._schedule_expiration(key, ttl)
 
         self._mark_accessed(key)
         return True
@@ -129,6 +139,8 @@ class SimpleMemoryCache(BaseCache[str]):
                 if key.startswith(namespace):
                     self.__delete(key)
         else:
+            for handle in self._handlers.values():
+                handle.cancel()
             self._cache = OrderedDict()
             self._handlers = {}
         return True
@@ -141,14 +153,19 @@ class SimpleMemoryCache(BaseCache[str]):
             return self.__delete(key)
         return 0
 
-    def __delete(self, key):
-        if self._cache.pop(key, None) is not None:
-            handle = self._handlers.pop(key, None)
-            if handle:
-                handle.cancel()
-            return 1
+    def __delete(self, key, expected_handle=None):
+        if expected_handle is not None and self._handlers.get(key) is not expected_handle:
+            # Stale timer from a previous generation of the entry; the key
+            # has been overwritten, deleted, expired or cleared since.
+            return 0
 
-        return 0
+        handle = self._handlers.pop(key, None)
+        if handle is not None:
+            handle.cancel()
+
+        existed = key in self._cache
+        self._cache.pop(key, None)
+        return 1 if existed else 0
 
     def build_key(self, key: str, namespace: Optional[str] = None) -> str:
         return self._str_build_key(key, namespace)

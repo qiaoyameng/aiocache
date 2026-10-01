@@ -159,11 +159,12 @@ class TestSimpleMemoryCache:
         memory._cache.pop.assert_any_call("nmb", None)
 
     async def test_clear_no_namespace(self, memory):
-        memory._handlers = "asdad"
-        memory._cache = "asdad"
+        fake = create_autospec(asyncio.TimerHandle, instance=True)
+        memory._handlers = {Keys.KEY: fake}
         await memory._clear()
-        memory._handlers = {}
-        memory._cache = {}
+        assert fake.cancel.call_count == 1
+        assert memory._handlers == {}
+        assert len(memory._cache) == 0
 
     async def test_raw(self, memory):
         await memory._raw("get", Keys.KEY)
@@ -174,6 +175,7 @@ class TestSimpleMemoryCache:
 
     async def test_redlock_release(self, memory):
         memory._cache.get.return_value = "lock"
+        memory._cache.__contains__.return_value = True
         fake = create_autospec(asyncio.TimerHandle, instance=True)
         memory._handlers[Keys.KEY] = fake
         assert await memory._redlock_release(Keys.KEY, "lock") == 1
@@ -382,3 +384,162 @@ class TestSimpleMemoryCache:
             assert isinstance(smc.serializer, PickleSerializer)
             await smc.set(Keys.KEY, value)
             assert await smc.get(Keys.KEY) == pickle.loads(serialized)
+
+
+class FakeTimerLoop:
+    """Controllable stand-in for the event loop.
+
+    Captures scheduled timer callbacks instead of running them, so tests
+    can fire expired callbacks manually at the exact moment they want,
+    including after the callback became stale (already queued for
+    execution when the entry was overwritten, deleted or cleared).
+    """
+
+    def __init__(self):
+        self.timers = []
+
+    def call_later(self, ttl, callback, *args):
+        handle = create_autospec(asyncio.TimerHandle, instance=True)
+        self.timers.append((ttl, callback, handle))
+        return handle
+
+    def fire(self, index=0):
+        """Simulate the timer at ``index`` expiring and its callback running."""
+        _, callback, handle = self.timers[index]
+        callback()
+        return handle
+
+
+@pytest.fixture
+def fake_loop():
+    loop = FakeTimerLoop()
+    with patch("asyncio.get_running_loop", return_value=loop):
+        yield loop
+
+
+class TestSimpleMemoryCacheTimerOwnership:
+    async def test_stale_timer_after_clear_does_not_delete_new_value(self, fake_loop):
+        cache = SimpleMemoryCache()
+        await cache.set("x", "old", ttl=10)
+        await cache.clear()
+        await cache.set("x", "new")  # no TTL
+
+        fake_loop.fire(0)  # stale timer from before the clear
+
+        assert await cache.get("x") == "new"
+        assert "x" not in cache._handlers
+
+    async def test_stale_timer_after_overwrite_does_not_delete_new_value(self, fake_loop):
+        cache = SimpleMemoryCache()
+        await cache.set("x", "old", ttl=10)
+        await cache.set("x", "new")  # overwrite without TTL
+
+        fake_loop.fire(0)  # stale timer from the first set
+
+        assert await cache.get("x") == "new"
+        assert "x" not in cache._handlers
+
+    async def test_stale_timer_after_delete_recreate_does_not_delete_new_value(self, fake_loop):
+        cache = SimpleMemoryCache()
+        await cache.set("x", "old", ttl=10)
+        await cache.delete("x")
+        await cache.set("x", "new")
+
+        fake_loop.fire(0)  # stale timer from the deleted entry
+
+        assert await cache.get("x") == "new"
+
+    async def test_stale_timer_after_expire_does_not_delete_entry(self, fake_loop):
+        cache = SimpleMemoryCache()
+        await cache.set("x", "value", ttl=10)
+        await cache.expire("x", 20)
+
+        fake_loop.fire(0)  # stale timer from the original set
+        assert await cache.get("x") == "value"
+
+        fake_loop.fire(1)  # current timer scheduled by expire
+        assert await cache.get("x") is None
+        assert "x" not in cache._handlers
+
+    async def test_stale_timer_after_eviction_does_not_delete_new_value(self, fake_loop):
+        cache = SimpleMemoryCache(maxsize=1)
+        await cache.set("x", "old", ttl=10)
+        await cache.set("y", "other")  # evicts x
+        await cache.set("x", "new")  # evicts y, x has no TTL
+
+        fake_loop.fire(0)  # stale timer from the evicted entry
+
+        assert await cache.get("x") == "new"
+        assert "x" not in cache._handlers
+
+    async def test_clear_cancels_ttl_handlers(self, fake_loop):
+        cache = SimpleMemoryCache()
+        await cache.set("x", "value", ttl=10)
+        handle = cache._handlers["x"]
+
+        await cache.clear()
+
+        handle.cancel.assert_called_once_with()
+        assert cache._handlers == {}
+        assert len(cache._cache) == 0
+
+    async def test_clear_namespace_preserves_other_entries_ttl(self, fake_loop):
+        cache = SimpleMemoryCache()
+        await cache.set("nm_key", "a", ttl=10)
+        await cache.set("other", "b", ttl=10)
+
+        await cache.clear(namespace="nm")
+
+        assert await cache.get("nm_key") is None
+        assert "nm_key" not in cache._handlers
+        # The surviving entry keeps its own TTL handler
+        assert "other" in cache._handlers
+        fake_loop.fire(1)
+        assert await cache.get("other") is None
+        assert "other" not in cache._handlers
+
+    async def test_none_value_expires_and_cleans_handler(self, fake_loop):
+        cache = SimpleMemoryCache()
+        await cache.set("x", None, ttl=10)
+        assert "x" in cache._handlers
+
+        fake_loop.fire(0)
+
+        assert not await cache.exists("x")
+        assert "x" not in cache._handlers
+
+    async def test_delete_none_value_cleans_handler(self, fake_loop):
+        cache = SimpleMemoryCache()
+        await cache.set("x", None, ttl=10)
+
+        assert await cache.delete("x") == 1
+        assert not await cache.exists("x")
+        assert "x" not in cache._handlers
+
+    async def test_own_timer_still_deletes_entry(self, fake_loop):
+        cache = SimpleMemoryCache()
+        await cache.set("x", "value", ttl=10)
+
+        fake_loop.fire(0)
+
+        assert await cache.get("x") is None
+        assert "x" not in cache._handlers
+
+    async def test_clear_then_reset_survives_old_ttl_with_real_loop(self):
+        cache = SimpleMemoryCache()
+        await cache.set("x", "old", ttl=0.05)
+        await cache.clear()
+        await cache.set("x", "new")  # no TTL
+
+        await asyncio.sleep(0.15)  # let the pre-clear timer fire
+
+        assert await cache.get("x") == "new"
+
+    async def test_overwrite_without_ttl_survives_old_ttl_with_real_loop(self):
+        cache = SimpleMemoryCache()
+        await cache.set("x", "old", ttl=0.05)
+        await cache.set("x", "new")  # no TTL
+
+        await asyncio.sleep(0.15)  # let the old timer fire
+
+        assert await cache.get("x") == "new"
