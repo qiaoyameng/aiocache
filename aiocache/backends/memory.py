@@ -1,4 +1,5 @@
 import asyncio
+import time
 from typing import Optional, OrderedDict
 
 from aiocache.base import BaseCache
@@ -24,6 +25,7 @@ class SimpleMemoryCache(BaseCache[str]):
     """
 
     NAME = "memory"
+    _supports_read_repair = True
 
     # TODO(PY312): https://peps.python.org/pep-0692/
     def __init__(self, **kwargs):
@@ -35,6 +37,8 @@ class SimpleMemoryCache(BaseCache[str]):
 
         self._cache: OrderedDict[str, object] = OrderedDict()
         self._handlers: dict[str, asyncio.TimerHandle] = {}
+        self._deadlines: dict[str, float] = {}
+        self._entry_versions: dict[str, int] = {}
 
     def _mark_accessed(self, key: str) -> None:
         """Move key to end to mark as recently used."""
@@ -50,7 +54,9 @@ class SimpleMemoryCache(BaseCache[str]):
             key, _ = self._cache.popitem(last=False)  # Remove LRU item
             if key in self._handlers:
                 self._handlers[key].cancel()
-                del self._handlers[key]
+            self._handlers.pop(key, None)
+            self._deadlines.pop(key, None)
+            self._bump_entry_version(key)
 
     async def _get(self, key, encoding="utf-8", _conn=None):
         self._mark_accessed(key)
@@ -59,6 +65,14 @@ class SimpleMemoryCache(BaseCache[str]):
     async def _gets(self, key, encoding="utf-8", _conn=None):
         return await self._get(key, encoding=encoding, _conn=_conn)
 
+    async def _get_for_read_repair(self, key, encoding="utf-8", _conn=None):
+        self._mark_accessed(key)
+        raw_value = self._cache.get(key)
+        if raw_value is None:
+            return None, None
+        token = (raw_value, self._entry_versions.get(key, 0))
+        return raw_value, token
+
     async def _multi_get(self, keys, encoding="utf-8", _conn=None):
         return [await self._get(key, encoding=encoding, _conn=_conn) for key in keys]
 
@@ -66,8 +80,15 @@ class SimpleMemoryCache(BaseCache[str]):
         if _cas_token is not None and self._cache.get(key) != _cas_token:
             return 0
 
+        self._bump_entry_version(key)
         if key in self._handlers:
             self._handlers[key].cancel()
+            del self._handlers[key]
+
+        if ttl:
+            self._deadlines[key] = time.monotonic() + ttl
+        else:
+            self._deadlines.pop(key, None)
 
         self._cache[key] = value
         self._cache.move_to_end(key)
@@ -94,6 +115,7 @@ class SimpleMemoryCache(BaseCache[str]):
         return key in self._cache
 
     async def _increment(self, key, delta, _conn=None):
+        self._bump_entry_version(key)
         if key not in self._cache:
             self._cache[key] = delta
         else:
@@ -108,14 +130,19 @@ class SimpleMemoryCache(BaseCache[str]):
         if key not in self._cache:
             return False
 
+        self._bump_entry_version(key)
         # Cancel existing timer
         if key in self._handlers:
             self._handlers[key].cancel()
+            del self._handlers[key]
 
         # Set new timer
         if ttl:
+            self._deadlines[key] = time.monotonic() + ttl
             loop = asyncio.get_running_loop()
             self._handlers[key] = loop.call_later(ttl, self.__delete, key)
+        else:
+            self._deadlines.pop(key, None)
 
         self._mark_accessed(key)
         return True
@@ -131,6 +158,8 @@ class SimpleMemoryCache(BaseCache[str]):
         else:
             self._cache = OrderedDict()
             self._handlers = {}
+            self._deadlines = {}
+            self._entry_versions = {}
         return True
 
     async def _raw(self, command, *args, encoding="utf-8", _conn=None, **kwargs):
@@ -143,12 +172,42 @@ class SimpleMemoryCache(BaseCache[str]):
 
     def __delete(self, key):
         if self._cache.pop(key, None) is not None:
+            self._bump_entry_version(key)
             handle = self._handlers.pop(key, None)
             if handle:
                 handle.cancel()
+            self._deadlines.pop(key, None)
             return 1
 
         return 0
+
+    async def _read_repair(self, key, repair_token, new_raw, _conn=None):
+        old_raw, entry_version = repair_token
+        current_raw = self._cache.get(key)
+        if current_raw is not old_raw:
+            return 0
+        if self._entry_versions.get(key, 0) != entry_version:
+            return 0
+
+        deadline = self._deadlines.get(key)
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return 0
+
+        self._cache[key] = new_raw
+        self._cache.move_to_end(key)
+        return 1
+
+    def _bump_entry_version(self, key: str) -> None:
+        self._entry_versions[key] = self._entry_versions.get(key, 0) + 1
+
+    def _remaining_ttl(self, key: str) -> Optional[float]:
+        deadline = self._deadlines.get(key)
+        if deadline is None:
+            return None
+        remaining = deadline - time.monotonic()
+        return remaining if remaining > 0 else 0
 
     def build_key(self, key: str, namespace: Optional[str] = None) -> str:
         return self._str_build_key(key, namespace)

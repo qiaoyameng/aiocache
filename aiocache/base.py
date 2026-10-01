@@ -1,5 +1,6 @@
 import asyncio
 import functools
+import inspect
 import logging
 import os
 import time
@@ -8,7 +9,8 @@ from enum import Enum
 from types import TracebackType
 from typing import Callable, Generic, List, Optional, Set, TYPE_CHECKING, Type, TypeVar
 
-from aiocache.serializers import StringSerializer
+from aiocache.exceptions import ReadRepairUnsupportedError
+from aiocache.serializers import StringSerializer, VersionedSerializer
 
 if TYPE_CHECKING:  # pragma: no cover
     from aiocache.plugins import BasePlugin
@@ -113,6 +115,7 @@ class BaseCache(Generic[CacheKeyType], ABC):
     """
 
     NAME: str
+    _supports_read_repair: bool = False
 
     def __init__(
         self,
@@ -130,6 +133,7 @@ class BaseCache(Generic[CacheKeyType], ABC):
         self._build_key = key_builder
 
         self._serializer = serializer or StringSerializer()
+        self._validate_read_repair()
         self._plugins = plugins or []
 
     @property
@@ -139,6 +143,7 @@ class BaseCache(Generic[CacheKeyType], ABC):
     @serializer.setter
     def serializer(self, value):
         self._serializer = value
+        self._validate_read_repair()
 
     @property
     def plugins(self):
@@ -147,6 +152,16 @@ class BaseCache(Generic[CacheKeyType], ABC):
     @plugins.setter
     def plugins(self, value):
         self._plugins = value
+
+    def _validate_read_repair(self) -> None:
+        if (
+            isinstance(self._serializer, VersionedSerializer)
+            and self._serializer.read_repair
+            and not self._supports_read_repair
+        ):
+            raise ReadRepairUnsupportedError(
+                f"{self.__class__.__name__} does not support versioned serializer read repair"
+            )
 
     @API.register
     @API.aiocache_enabled(fake_return=True)
@@ -205,7 +220,20 @@ class BaseCache(Generic[CacheKeyType], ABC):
         loads = loads_fn or self.serializer.loads
         ns_key = self.build_key(key, namespace)
 
-        value = loads(await self._get(ns_key, encoding=self.serializer.encoding, _conn=_conn))
+        use_read_repair = (
+            loads_fn is None and isinstance(self.serializer, VersionedSerializer)
+            and self.serializer.read_repair
+        )
+        if use_read_repair:
+            raw_value, token = await self._get_for_read_repair(
+                ns_key, encoding=self.serializer.encoding, _conn=_conn
+            )
+        else:
+            raw_value = await self._get(ns_key, encoding=self.serializer.encoding, _conn=_conn)
+            token = None
+        value = await self._load_value(
+            raw_value, loads, ns_key, token, use_read_repair, _conn=_conn
+        )
 
         logger.debug("GET %s %s (%.4f)s", ns_key, value is not None, time.monotonic() - start)
         return value if value is not None else default
@@ -217,6 +245,40 @@ class BaseCache(Generic[CacheKeyType], ABC):
     @abstractmethod
     async def _gets(self, key, encoding="utf-8", _conn=None):
         raise NotImplementedError()
+
+    async def _get_for_read_repair(self, key, encoding="utf-8", _conn=None):
+        raw_value = await self._get(key, encoding=encoding, _conn=_conn)
+        return raw_value, raw_value
+
+    async def _load_value(self, raw_value, loads, key, repair_token, use_read_repair, _conn=None):
+        if raw_value is None:
+            return None
+
+        if use_read_repair and isinstance(self.serializer, VersionedSerializer):
+            result = self.serializer.loads_versioned(raw_value)
+            if inspect.isawaitable(result):
+                result = await result
+
+            if result.migrated:
+                migrated_raw = self.serializer.dumps(result.payload)
+                await asyncio.sleep(0)
+                await self._read_repair(
+                    key,
+                    repair_token,
+                    migrated_raw,
+                    _conn=_conn
+                )
+            return result.payload
+
+        value = loads(raw_value)
+        if inspect.isawaitable(value):
+            value = await value
+        return value
+
+    async def _read_repair(self, key, repair_token, new_raw, _conn=None):
+        raise ReadRepairUnsupportedError(
+            f"{self.__class__.__name__} does not support versioned serializer read repair"
+        )
 
     @API.register
     @API.aiocache_enabled(fake_return=[])
@@ -239,11 +301,21 @@ class BaseCache(Generic[CacheKeyType], ABC):
 
         ns_keys = [self.build_key(key, namespace) for key in keys]
         values = [
-            loads(value)
+            value
             for value in await self._multi_get(
                 ns_keys, encoding=self.serializer.encoding, _conn=_conn
             )
         ]
+        loaded_values = []
+        for value in values:
+            if value is None:
+                loaded_values.append(None)
+                continue
+            value = loads(value)
+            if inspect.isawaitable(value):
+                value = await value
+            loaded_values.append(value)
+        values = loaded_values
 
         logger.debug(
             "MULTI_GET %s %d (%.4f)s",

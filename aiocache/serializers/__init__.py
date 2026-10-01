@@ -1,11 +1,22 @@
 import logging
 
+from aiocache.exceptions import (
+    CorruptedPayloadError,
+    InvalidMigrationError,
+    MigrationCycleError,
+    MigrationError,
+    MissingMigrationError,
+    ReadRepairUnsupportedError,
+    UnknownVersionError,
+)
+
 from .serializers import (
     BaseSerializer,
     JsonSerializer,
     NullSerializer,
     PickleSerializer,
     StringSerializer,
+    VersionedSerializer,
 )
 
 logger = logging.getLogger(__name__)
@@ -28,4 +39,12 @@ __all__ = [
     "PickleSerializer",
     "JsonSerializer",
     "MsgPackSerializer",
+    "VersionedSerializer",
+    "MigrationError",
+    "MissingMigrationError",
+    "MigrationCycleError",
+    "InvalidMigrationError",
+    "UnknownVersionError",
+    "CorruptedPayloadError",
+    "ReadRepairUnsupportedError",
 ]

@@ -54,6 +54,31 @@ MsgPackSerializer
 .. autoclass:: aiocache.serializers.MsgPackSerializer
   :members:
 
+..  _versionedserializer:
+
+VersionedSerializer
+-------------------
+
+``VersionedSerializer`` wraps values with an explicit format version. Older
+values are migrated through functions supplied in a registry; migration code
+is never selected or imported from cache contents::
+
+    >>> from aiocache import SimpleMemoryCache
+    >>> from aiocache.serializers import VersionedSerializer
+    >>> serializer = VersionedSerializer(
+    ...     current_version=2,
+    ...     migrations={(1, 2): lambda payload: payload.upper()},
+    ...     read_repair=True,
+    ... )
+    >>> cache = SimpleMemoryCache(serializer=serializer)
+
+``SimpleMemoryCache`` can perform read repair. Other backends read and convert
+old values when ``read_repair`` is disabled, but reject enabling repair because
+they do not provide the required atomic, TTL-preserving replacement.
+
+.. autoclass:: aiocache.serializers.VersionedSerializer
+  :members:
+
 In case the current serializers are not covering your needs, you can always define your custom serializer as shown in ``examples/serializer_class.py``:
 
 .. literalinclude:: ../examples/serializer_class.py
