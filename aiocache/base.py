@@ -6,8 +6,22 @@ import time
 from abc import ABC, abstractmethod
 from enum import Enum
 from types import TracebackType
-from typing import Callable, Generic, List, Optional, Set, TYPE_CHECKING, Type, TypeVar
+from typing import (
+    Callable,
+    Dict,
+    Generic,
+    Hashable,
+    Iterable,
+    List,
+    Optional,
+    Set,
+    Tuple,
+    TYPE_CHECKING,
+    Type,
+    TypeVar,
+)
 
+from aiocache.exceptions import TagsNotSupportedError
 from aiocache.serializers import StringSerializer
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -113,6 +127,7 @@ class BaseCache(Generic[CacheKeyType], ABC):
     """
 
     NAME: str
+    supports_tags = False
 
     def __init__(
         self,
@@ -152,7 +167,17 @@ class BaseCache(Generic[CacheKeyType], ABC):
     @API.aiocache_enabled(fake_return=True)
     @API.timeout
     @API.plugins
-    async def add(self, key, value, ttl=SENTINEL, dumps_fn=None, namespace=None, _conn=None):
+    async def add(
+        self,
+        key,
+        value,
+        ttl=SENTINEL,
+        dumps_fn=None,
+        namespace=None,
+        tags=None,
+        if_tag_generation=None,
+        _conn=None,
+    ):
         """
         Stores the value in the given key with ttl if specified. Raises an error if the
         key already exists.
@@ -164,6 +189,9 @@ class BaseCache(Generic[CacheKeyType], ABC):
             need miliseconds, valkey and memory support float ttls
         :param dumps_fn: callable alternative to use as dumps function
         :param namespace: str alternative namespace to use
+        :param tags: optional iterable of tags to associate with the key
+        :param if_tag_generation: write only when no tag invalidation happened after this
+            generation
         :param timeout: int or float in seconds specifying maximum timeout
             for the operations to last
         :returns: True if key is inserted
@@ -175,13 +203,17 @@ class BaseCache(Generic[CacheKeyType], ABC):
         dumps = dumps_fn or self.serializer.dumps
         ns_key = self.build_key(key, namespace)
 
-        await self._add(ns_key, dumps(value), ttl=self._get_ttl(ttl), _conn=_conn)
+        tag_options = self._tag_write_options(tags, namespace, if_tag_generation)
+
+        result = await self._add(
+            ns_key, dumps(value), ttl=self._get_ttl(ttl), _conn=_conn, **tag_options
+        )
 
         logger.debug("ADD %s %s (%.4f)s", ns_key, True, time.monotonic() - start)
-        return True
+        return result
 
     @abstractmethod
-    async def _add(self, key, value, ttl, _conn=None):
+    async def _add(self, key, value, ttl, tags=SENTINEL, _tag_generation=None, _conn=None):
         raise NotImplementedError()
 
     @API.register
@@ -262,7 +294,16 @@ class BaseCache(Generic[CacheKeyType], ABC):
     @API.timeout
     @API.plugins
     async def set(
-        self, key, value, ttl=SENTINEL, dumps_fn=None, namespace=None, _cas_token=None, _conn=None
+        self,
+        key,
+        value,
+        ttl=SENTINEL,
+        dumps_fn=None,
+        namespace=None,
+        tags=None,
+        if_tag_generation=None,
+        _cas_token=None,
+        _conn=None,
     ):
         """
         Stores the value in the given key with ttl if specified
@@ -274,6 +315,9 @@ class BaseCache(Generic[CacheKeyType], ABC):
             need miliseconds, valkey and memory support float ttls
         :param dumps_fn: callable alternative to use as dumps function
         :param namespace: str alternative namespace to use
+        :param tags: optional iterable of tags to associate with the key
+        :param if_tag_generation: write only when no tag invalidation happened after this
+            generation
         :param timeout: int or float in seconds specifying maximum timeout
             for the operations to last
         :returns: True if the value was set
@@ -283,16 +327,53 @@ class BaseCache(Generic[CacheKeyType], ABC):
         dumps = dumps_fn or self.serializer.dumps
         ns_key = self.build_key(key, namespace)
 
+        tag_options = self._tag_write_options(tags, namespace, if_tag_generation)
+
         res = await self._set(
-            ns_key, dumps(value), ttl=self._get_ttl(ttl), _cas_token=_cas_token, _conn=_conn
+            ns_key,
+            dumps(value),
+            ttl=self._get_ttl(ttl),
+            _cas_token=_cas_token,
+            _conn=_conn,
+            **tag_options,
         )
 
         logger.debug("SET %s %d (%.4f)s", ns_key, True, time.monotonic() - start)
         return res
 
     @abstractmethod
-    async def _set(self, key, value, ttl, _cas_token=None, _conn=None):
+    async def _set(
+        self, key, value, ttl, tags=SENTINEL, _tag_generation=None,
+        _cas_token=None, _conn=None
+    ):
         raise NotImplementedError()
+
+    @API.register
+    @API.aiocache_enabled(fake_return=0)
+    @API.timeout
+    @API.plugins
+    async def current_tag_generation(self, _conn=None):
+        """Return the current global tag invalidation generation."""
+        self._require_tags_support()
+        return await self._current_tag_generation(_conn=_conn)
+
+    async def _current_tag_generation(self, _conn=None):
+        name = getattr(self, "NAME", self.__class__.__name__)
+        raise TagsNotSupportedError(f"{name} backend does not support cache tags")
+
+    @API.register
+    @API.aiocache_enabled(fake_return=0)
+    @API.timeout
+    @API.plugins
+    async def invalidate(self, tag, namespace=None, _conn=None):
+        """Delete every key associated with the supplied tag."""
+        self._require_tags_support()
+        ns_tag = self.build_key(tag, namespace)
+        return await self._invalidate(ns_tag, _conn=_conn)
+
+    async def _invalidate(self, tag, _conn=None):
+        name = getattr(self, "NAME", self.__class__.__name__)
+        raise TagsNotSupportedError(f"{name} backend does not support cache tags")
 
     @API.register
     @API.aiocache_enabled(fake_return=True)
@@ -524,6 +605,43 @@ class BaseCache(Generic[CacheKeyType], ABC):
 
     def _get_ttl(self, ttl):
         return ttl if ttl is not SENTINEL else self.ttl
+
+    @staticmethod
+    def _normalize_tags(tags: Optional[Iterable[Hashable]]) -> Optional[Tuple[Hashable, ...]]:
+        if tags is None:
+            return None
+        if isinstance(tags, (str, bytes)):
+            return (tags,)
+        return tuple(tags)
+
+    def _require_tags_support(self) -> None:
+        if not self.supports_tags:
+            name = getattr(self, "NAME", self.__class__.__name__)
+            raise TagsNotSupportedError(f"{name} backend does not support cache tags")
+
+    def _tag_write_options(
+        self,
+        tags: Optional[Iterable[Hashable]],
+        namespace: Optional[str],
+        if_tag_generation,
+    ) -> Dict[str, object]:
+        options: Dict[str, object] = {}
+        normalized_tags = self._normalize_tags(tags)
+        if tags is not None or if_tag_generation is not None:
+            self._require_tags_support()
+
+        if self.supports_tags and normalized_tags is None:
+            normalized_tags = ()
+
+        if normalized_tags is not None:
+            options["tags"] = tuple(
+                self.build_key(tag, namespace) for tag in normalized_tags
+            )
+
+        if if_tag_generation is not None:
+            options["_tag_generation"] = if_tag_generation
+
+        return options
 
     def get_connection(self):
         return _Conn(self)

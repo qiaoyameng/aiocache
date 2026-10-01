@@ -93,6 +93,7 @@ class TestCached:
         assert decorator.cache.get.call_count == 1
         assert decorator.cache.set.call_count == 0
         assert stub.call_count == 1
+        assert decorator.cache.current_tag_generation.call_count == 0
 
     async def test_disable_params_not_propagated(self, decorator, decorator_call):
         decorator.cache.get.return_value = None
@@ -186,6 +187,123 @@ class TestCached:
         await what()
 
         assert mock_cache.get.call_count == 2
+
+    async def test_decorator_tags_use_args_and_result(self):
+        cache = SimpleMemoryCache()
+        calls = 0
+
+        def tags(f, args, kwargs, result):
+            return ("product:" + str(kwargs["product_id"]), "taxes:" + result["region"])
+
+        @cached(cache=cache, tags=tags)
+        async def price(product_id):
+            nonlocal calls
+            calls += 1
+            return {"region": "cn", "amount": 100}
+
+        assert await price(product_id="sku-1") == {"region": "cn", "amount": 100}
+        assert await price(product_id="sku-1") == {"region": "cn", "amount": 100}
+        assert calls == 1
+        assert cache._key_tags == {
+            "tests.ut.test_decoratorsprice()[('product_id', 'sku-1')]": {
+                "product:sku-1",
+                "taxes:cn",
+            }
+        }
+
+        assert await cache.invalidate("product:sku-1") == 1
+        assert await price(product_id="sku-1") == {"region": "cn", "amount": 100}
+        assert calls == 2
+
+        assert await cache.invalidate("taxes:cn") == 1
+        assert await price(product_id="sku-1") == {"region": "cn", "amount": 100}
+        assert calls == 3
+
+    async def test_invalidation_rejects_result_started_before_it(self):
+        cache = SimpleMemoryCache()
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        @cached(cache=cache, key_builder=lambda *args, **kwargs: "price", tags=("taxes",))
+        async def calculate():
+            started.set()
+            await release.wait()
+            return "stale-price"
+
+        calculation = asyncio.create_task(calculate())
+        await started.wait()
+
+        assert await cache.invalidate("taxes") == 0
+        release.set()
+        assert await calculation == "stale-price"
+        assert await cache.get("price", default="missing") == "missing"
+
+        assert await calculate() == "stale-price"
+        assert await cache.get("price") == "stale-price"
+
+    async def test_decorator_rewrite_replaces_tags(self):
+        cache = SimpleMemoryCache()
+
+        @cached(
+            cache=cache,
+            key_builder=lambda *args, **kwargs: "price",
+            tags=lambda f, args, kwargs, result: (result,),
+        )
+        async def price(region):
+            return region
+
+        await price("old-region")
+        await price("new-region", cache_read=False)
+
+        assert await cache.invalidate("old-region") == 0
+        assert await cache.get("price") == "new-region"
+
+        assert await cache.invalidate("new-region") == 1
+        assert await cache.get("price", default="missing") == "missing"
+
+    async def test_decorator_callback_can_return_single_string_tag(self):
+        cache = SimpleMemoryCache()
+
+        @cached(cache=cache, tags=lambda f, args, kwargs, result: result)
+        async def fn():
+            return "product"
+
+        await fn()
+
+        assert cache._key_tags == {"tests.ut.test_decoratorsfn()[]": {"product"}}
+        assert await cache.invalidate("product") == 1
+
+    async def test_decorator_callback_can_skip_tags_by_returning_none(self):
+        cache = SimpleMemoryCache()
+
+        @cached(
+            cache=cache,
+            key_builder=lambda *args, **kwargs: "price",
+            tags=lambda f, args, kwargs, result: None,
+        )
+        async def fn():
+            return "value"
+
+        await fn()
+
+        assert await cache.get("price") == "value"
+        assert cache._tags == {}
+        assert cache._key_tags == {}
+
+    async def test_tags_backend_is_required_only_when_writing(self):
+        cache = SimpleMemoryCache()
+        cache.supports_tags = False
+        calls = 0
+
+        @cached(cache=cache, tags=("product",))
+        async def fn():
+            nonlocal calls
+            calls += 1
+            return "value"
+
+        assert await fn(cache_write=False) == "value"
+        assert calls == 1
+        assert await cache.get("key", default="missing") == "missing"
 
 
 class TestCachedStampede:

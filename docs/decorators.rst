@@ -17,6 +17,22 @@ cached
   :language: python
   :linenos:
 
+The optional ``tags`` argument can be an iterable or a callable. The callable receives the
+wrapped function, its positional and keyword arguments and the computed result, so tags can
+depend on both the request and the response:
+
+.. code-block:: python
+
+    @cached(
+        cache=cache,
+        tags=lambda f, args, kwargs, result: (
+            f"product:{kwargs['product_id']}",
+            f"taxes:{result['region']}",
+        ),
+    )
+    async def price(product_id):
+        ...
+
 ..  _multi_cached:
 
 multi_cached

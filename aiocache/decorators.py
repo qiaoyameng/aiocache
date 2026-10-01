@@ -23,6 +23,8 @@ class cached:
         wrapped function and should return `True` if the value should skip the
         cache (or `False` to store in the cache).
         e.g. to avoid caching `None` results: `lambda r: r is None`
+    :param tags: iterable of tags or callable receiving the wrapped function, call args,
+        call kwargs and result, returning the tags to associate with the cached value
     :param noself: bool if you are decorating a class function, by default self is also used to
         generate the key. This will result in same function calls done by different class instances
         to use different cache keys. Use noself=True if you want to ignore it.
@@ -35,11 +37,13 @@ class cached:
         ttl=SENTINEL,
         key_builder=None,
         skip_cache_func=lambda x: False,
+        tags=None,
         noself=False,
     ):
         self.ttl = ttl
         self.key_builder = key_builder
         self.skip_cache_func = skip_cache_func
+        self.tags = tags
         self.noself = noself
         self.cache = cache
 
@@ -55,6 +59,7 @@ class cached:
         self, f, *args, cache_read=True, cache_write=True, aiocache_wait_for_write=True, **kwargs
     ):
         key = self.get_cache_key(f, args, kwargs)
+        tag_generation = await self._initial_tag_generation(cache_write)
 
         if cache_read:
             value = await self.get_from_cache(key)
@@ -67,11 +72,12 @@ class cached:
             return result
 
         if cache_write:
+            tags = self.get_cache_tags(f, args, kwargs, result)
             if aiocache_wait_for_write:
-                await self.set_in_cache(key, result)
+                await self._set_in_cache(key, result, tags, tag_generation)
             else:
                 # TODO: Use aiojobs to avoid warnings.
-                asyncio.create_task(self.set_in_cache(key, result))
+                asyncio.create_task(self._set_in_cache(key, result, tags, tag_generation))
 
         return result
 
@@ -80,6 +86,33 @@ class cached:
             return self.key_builder(f, *args, **kwargs)
 
         return self._key_from_args(f, args, kwargs)
+
+    def get_cache_tags(self, f, args, kwargs, result):
+        if self.tags is None:
+            return None
+        if callable(self.tags):
+            tags = self.tags(f, args, kwargs, result)
+            if tags is None:
+                return None
+            if isinstance(tags, (str, bytes)):
+                return (tags,)
+            return tuple(tags)
+        if isinstance(self.tags, (str, bytes)):
+            return (self.tags,)
+        return tuple(self.tags)
+
+    async def _initial_tag_generation(self, cache_write):
+        if cache_write and (callable(self.tags) or self.tags):
+            return await self.cache.current_tag_generation()
+        return None
+
+    async def _set_in_cache(self, key, value, tags=None, tag_generation=None):
+        if not tags:
+            await self.set_in_cache(key, value)
+        else:
+            await self.set_in_cache(
+                key, value, tags=tags, tag_generation=tag_generation
+            )
 
     def _key_from_args(self, func, args, kwargs):
         ordered_kwargs = sorted(kwargs.items())
@@ -97,9 +130,18 @@ class cached:
             logger.exception("Couldn't retrieve %s, unexpected error", key)
         return None
 
-    async def set_in_cache(self, key, value):
+    async def set_in_cache(self, key, value, tags=None, tag_generation=None):
         try:
-            await self.cache.set(key, value, ttl=self.ttl)
+            if not tags:
+                await self.cache.set(key, value, ttl=self.ttl)
+            else:
+                await self.cache.set(
+                    key,
+                    value,
+                    ttl=self.ttl,
+                    tags=tags,
+                    if_tag_generation=tag_generation,
+                )
         except Exception:
             logger.exception("Couldn't set %s in key %s, unexpected error", value, key)
 
@@ -134,6 +176,7 @@ class cached_stampede(cached):
 
     async def decorator(self, f, *args, **kwargs):
         key = self.get_cache_key(f, args, kwargs)
+        tag_generation = await self._initial_tag_generation(cache_write=True)
 
         value = await self.get_from_cache(key)
         if value is not None:
@@ -149,7 +192,8 @@ class cached_stampede(cached):
             if self.skip_cache_func(result):
                 return result
 
-            await self.set_in_cache(key, result)
+            tags = self.get_cache_tags(f, args, kwargs, result)
+            await self._set_in_cache(key, result, tags, tag_generation)
 
         return result
 

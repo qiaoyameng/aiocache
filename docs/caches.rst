@@ -28,6 +28,8 @@ The supported commands are:
   - add
   - get
   - set
+  - current_tag_generation
+  - invalidate
   - multi_get
   - multi_set
   - delete
@@ -38,6 +40,21 @@ The supported commands are:
   - raw
 
 If you feel a command is missing here do not hesitate to `open an issue <https://github.com/argaen/aiocache/issues>`_
+
+Cache tags
+----------
+
+The in-memory backend can associate one cache key with one or more tags:
+
+.. code-block:: python
+
+    await cache.set("product-price", value, tags=("product:42", "taxes:cn"))
+    await cache.invalidate("taxes:cn")
+
+Invalidating a tag removes every key associated with it. Rewriting an existing key replaces
+its previous tag associations; deleting a key, letting its TTL expire or LRU-evicting it also
+removes its tag index entries. Other backends raise
+``aiocache.exceptions.TagsNotSupportedError`` until they implement tag operations.
 
 
 ..  _basecache:

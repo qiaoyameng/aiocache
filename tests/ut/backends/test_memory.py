@@ -6,8 +6,9 @@ import pytest
 
 from aiocache.backends.memory import SimpleMemoryCache
 from aiocache.base import BaseCache
+from aiocache.exceptions import TagsNotSupportedError
 from aiocache.serializers import NullSerializer, PickleSerializer
-from ...utils import Keys
+from ...utils import ConcreteBaseCache, Keys
 
 
 @pytest.fixture
@@ -18,6 +19,152 @@ def memory(mocker):
 
 
 class TestSimpleMemoryCache:
+    async def test_tags_shared_and_cross_invalidation(self):
+        cache = SimpleMemoryCache()
+
+        await cache.set("product-taxes", "both", tags=("product", "taxes"))
+        await cache.set("product-only", "product", tags=("product",))
+        await cache.set("taxes-only", "taxes", tags=("taxes",))
+
+        assert await cache.invalidate("product") == 2
+        assert await cache.get("product-taxes") is None
+        assert await cache.get("product-only") is None
+        assert await cache.get("taxes-only") == "taxes"
+        assert "product" not in cache._tags
+        assert cache._tags == {"taxes": {"taxes-only"}}
+        assert cache._key_tags == {"taxes-only": {"taxes"}}
+
+        assert await cache.invalidate("taxes") == 1
+        assert len(cache._cache) == 0
+        assert cache._tags == {}
+        assert cache._key_tags == {}
+
+    async def test_set_rewrite_replaces_tags(self):
+        cache = SimpleMemoryCache()
+
+        await cache.set("key", "old", tags=("product", "taxes"))
+        await cache.set("key", "new", tags=("region",))
+
+        assert await cache.invalidate("product") == 0
+        assert await cache.get("key") == "new"
+
+        assert await cache.invalidate("region") == 1
+        assert await cache.get("key") is None
+        assert cache._tags == {}
+        assert cache._key_tags == {}
+
+        await cache.set("key", "tagged", tags=("product",))
+        await cache.set("key", "untagged")
+        assert await cache.invalidate("product") == 0
+        assert await cache.get("key") == "untagged"
+        assert cache._key_tags == {}
+
+    async def test_tags_are_namespaced(self):
+        cache = SimpleMemoryCache(namespace="orders:")
+
+        await cache.set("key", "value", tags=("taxes",))
+
+        assert cache._tags == {"orders:taxes": {"orders:key"}}
+        assert await cache.invalidate("taxes") == 1
+
+    async def test_delete_cleans_tag_indexes(self):
+        cache = SimpleMemoryCache()
+
+        await cache.set("shared", "value", tags=("product", "taxes"))
+        assert await cache.delete("shared") == 1
+
+        assert cache._tags == {}
+        assert cache._key_tags == {}
+        assert await cache.invalidate("product") == 0
+
+    async def test_ttl_and_lru_do_not_leave_tag_indexes(self):
+        cache = SimpleMemoryCache(maxsize=3)
+
+        await cache.set("expiring", "old", ttl=0.01, tags=("taxes",))
+        await asyncio.sleep(0.03)
+
+        assert len(cache._cache) == 0
+        assert cache._tags == {}
+        assert cache._key_tags == {}
+        assert "expiring" not in cache._handlers
+
+        await cache.set("evicting", "old", tags=("product",))
+        await cache.set("keeping-1", "1")
+        await cache.set("keeping-2", "2")
+        await cache.set("keeping-3", "3")
+
+        assert "evicting" not in cache._cache
+        assert cache._tags == {}
+        assert cache._key_tags == {}
+
+    async def test_repeated_rewrites_and_expiration_do_not_leave_orphans(self):
+        cache = SimpleMemoryCache(maxsize=4)
+
+        for index in range(20):
+            key = f"key-{index % 6}"
+            tags = (f"tag-{index % 3}",)
+            await cache.set(key, index, ttl=0.02, tags=tags)
+            if index % 4 == 0:
+                await cache.set(key, index, ttl=0.02)
+
+        await asyncio.sleep(0.04)
+
+        self.assert_tag_indexes_match_data(cache)
+
+        await cache.set("last", "value", tags=("survivor",))
+        await cache.invalidate("survivor")
+        self.assert_tag_indexes_match_data(cache)
+
+    @staticmethod
+    def assert_tag_indexes_match_data(cache):
+        indexed_keys = {key for tagged_keys in cache._tags.values() for key in tagged_keys}
+
+        assert indexed_keys == set(cache._key_tags)
+        assert set(cache._key_tags).issubset(cache._cache)
+        assert all(tagged_keys for tagged_keys in cache._tags.values())
+        for key, tags in cache._key_tags.items():
+            for tag in tags:
+                assert key in cache._tags[tag]
+
+    async def test_tag_generation_rejects_stale_conditional_write(self):
+        cache = SimpleMemoryCache()
+        generation = await cache.current_tag_generation()
+        await cache.set("current", "first", tags=("product",))
+        assert await cache.invalidate("product") == 1
+
+        assert (
+            await cache.set(
+                "stale",
+                "old-result",
+                tags=("product",),
+                if_tag_generation=generation,
+            )
+            == 0
+        )
+        assert await cache.get("stale", default="missing") == "missing"
+
+        await cache.set("current", "first", tags=("product",))
+        assert await cache.invalidate("product") == 1
+        assert (
+            await cache.add(
+                "stale-add",
+                "old-result",
+                tags=("product",),
+                if_tag_generation=generation,
+            )
+            == 0
+        )
+        assert await cache.get("stale-add", default="missing") == "missing"
+
+    async def test_tags_unsupported_by_other_backend(self):
+        cache = ConcreteBaseCache()
+
+        with pytest.raises(TagsNotSupportedError):
+            await cache.set("key", "value", tags=("product",))
+
+        with pytest.raises(TagsNotSupportedError):
+            await cache.invalidate("product")
+
     async def test_get(self, memory):
         await memory._get(Keys.KEY)
         memory._cache.get.assert_called_with(Keys.KEY)
