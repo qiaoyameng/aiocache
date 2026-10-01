@@ -382,3 +382,177 @@ class TestSimpleMemoryCache:
             assert isinstance(smc.serializer, PickleSerializer)
             await smc.set(Keys.KEY, value)
             assert await smc.get(Keys.KEY) == pickle.loads(serialized)
+
+
+def assert_tag_index_consistent(cache):
+    """Every index entry must point at live data and vice versa."""
+    for key, tags in cache._key_tags.items():
+        assert key in cache._cache, f"key_tags entry without data: {key}"
+        for tag in tags:
+            assert key in cache._tag_index.get(tag, set())
+    for tag, keys in cache._tag_index.items():
+        assert keys, f"empty tag bucket left behind: {tag}"
+        for key in keys:
+            assert key in cache._cache, f"tag index entry without data: {tag}/{key}"
+            assert tag in cache._key_tags.get(key, set())
+
+
+class TestSimpleMemoryCacheTags:
+    @pytest.fixture
+    def tag_cache(self):
+        return SimpleMemoryCache()
+
+    async def test_supports_tags(self, tag_cache):
+        assert tag_cache.SUPPORTS_TAGS is True
+
+    async def test_set_with_tags_builds_index(self, tag_cache):
+        await tag_cache.set("key1", "value", tags=["product", "tax"])
+
+        assert tag_cache._tag_index == {"product": {"key1"}, "tax": {"key1"}}
+        assert tag_cache._key_tags == {"key1": {"product", "tax"}}
+
+    async def test_invalidate_tag_removes_shared_keys(self, tag_cache):
+        await tag_cache.set("key1", "v1", tags=["shared", "product"])
+        await tag_cache.set("key2", "v2", tags=["shared"])
+        await tag_cache.set("key3", "v3", tags=["other"])
+
+        assert await tag_cache.invalidate_tag("shared") == 2
+
+        assert await tag_cache.get("key1") is None
+        assert await tag_cache.get("key2") is None
+        assert await tag_cache.get("key3") == "v3"
+        assert_tag_index_consistent(tag_cache)
+
+    async def test_invalidate_tag_with_crossing_tags(self, tag_cache):
+        await tag_cache.set("key1", "v1", tags=["t1", "t2"])
+        await tag_cache.set("key2", "v2", tags=["t2", "t3"])
+
+        assert await tag_cache.invalidate_tag("t2") == 2
+        assert await tag_cache.get("key1") is None
+        assert await tag_cache.get("key2") is None
+
+        await tag_cache.set("key1", "v1", tags=["t1", "t2"])
+        await tag_cache.set("key2", "v2", tags=["t2", "t3"])
+
+        assert await tag_cache.invalidate_tag("t1") == 1
+        assert await tag_cache.get("key1") is None
+        assert await tag_cache.get("key2") == "v2"
+        assert tag_cache._tag_index == {"t2": {"key2"}, "t3": {"key2"}}
+        assert_tag_index_consistent(tag_cache)
+
+    async def test_invalidate_unknown_tag(self, tag_cache):
+        await tag_cache.set("key1", "v1", tags=["t1"])
+
+        assert await tag_cache.invalidate_tag("unknown") == 0
+        assert await tag_cache.get("key1") == "v1"
+        assert_tag_index_consistent(tag_cache)
+
+    async def test_overwrite_replaces_old_tags(self, tag_cache):
+        await tag_cache.set("key1", "v1", tags=["t1"])
+        await tag_cache.set("key1", "v2", tags=["t2"])
+
+        assert await tag_cache.invalidate_tag("t1") == 0
+        assert await tag_cache.get("key1") == "v2"
+
+        assert await tag_cache.invalidate_tag("t2") == 1
+        assert await tag_cache.get("key1") is None
+        assert_tag_index_consistent(tag_cache)
+
+    async def test_overwrite_without_tags_drops_old_tags(self, tag_cache):
+        await tag_cache.set("key1", "v1", tags=["t1"])
+        await tag_cache.set("key1", "v2")
+
+        assert await tag_cache.invalidate_tag("t1") == 0
+        assert await tag_cache.get("key1") == "v2"
+        assert_tag_index_consistent(tag_cache)
+
+    async def test_delete_cleans_tag_index(self, tag_cache):
+        await tag_cache.set("key1", "v1", tags=["t1", "t2"])
+
+        await tag_cache.delete("key1")
+
+        assert tag_cache._tag_index == {}
+        assert tag_cache._key_tags == {}
+
+    async def test_ttl_expiry_cleans_tag_index(self, tag_cache):
+        await tag_cache.set("key1", "v1", ttl=0.01, tags=["t1"])
+
+        await asyncio.sleep(0.05)
+
+        assert await tag_cache.get("key1") is None
+        assert tag_cache._tag_index == {}
+        assert tag_cache._key_tags == {}
+
+    async def test_lru_eviction_cleans_tag_index(self):
+        cache = SimpleMemoryCache(maxsize=1)
+        await cache.set("key1", "v1", tags=["t1"])
+        await cache.set("key2", "v2", tags=["t2"])
+
+        assert await cache.get("key1") is None
+        assert cache._tag_index == {"t2": {"key2"}}
+        assert cache._key_tags == {"key2": {"t2"}}
+        assert_tag_index_consistent(cache)
+
+    async def test_clear_cleans_tag_index(self, tag_cache):
+        await tag_cache.set("key1", "v1", tags=["t1"])
+        await tag_cache.clear()
+
+        assert tag_cache._tag_index == {}
+        assert tag_cache._key_tags == {}
+
+    async def test_clear_namespace_cleans_tag_index(self, tag_cache):
+        await tag_cache.set("key1", "v1", namespace="ns", tags=["t1"])
+        await tag_cache.set("key2", "v2", tags=["t2"])
+
+        await tag_cache.clear(namespace="ns")
+
+        assert tag_cache._tag_index == {"t2": {"key2"}}
+        assert_tag_index_consistent(tag_cache)
+
+    async def test_stale_write_after_invalidation_is_refused(self, tag_cache):
+        version = tag_cache.get_tags_version()
+        await tag_cache.invalidate_tag("t1")
+
+        res = await tag_cache.set("key1", "v1", tags=["t1"], _tags_version=version)
+
+        assert res is False
+        assert await tag_cache.get("key1") is None
+        assert tag_cache._tag_index == {}
+
+    async def test_unrelated_invalidation_does_not_block_write(self, tag_cache):
+        version = tag_cache.get_tags_version()
+        await tag_cache.invalidate_tag("other")
+
+        res = await tag_cache.set("key1", "v1", tags=["t1"], _tags_version=version)
+
+        assert res is True
+        assert await tag_cache.get("key1") == "v1"
+        assert_tag_index_consistent(tag_cache)
+
+    async def test_fresh_write_after_invalidation_is_allowed(self, tag_cache):
+        await tag_cache.invalidate_tag("t1")
+        version = tag_cache.get_tags_version()
+
+        res = await tag_cache.set("key1", "v1", tags=["t1"], _tags_version=version)
+
+        assert res is True
+        assert await tag_cache.get("key1") == "v1"
+        assert_tag_index_consistent(tag_cache)
+
+    async def test_repeated_churn_leaves_no_orphan_index_entries(self):
+        cache = SimpleMemoryCache(maxsize=8)
+        tags = ["product", "tax", "promo"]
+
+        for i in range(200):
+            key = f"key{i % 20}"
+            await cache.set(key, i, ttl=0.01, tags=[tags[i % 3], tags[(i + 1) % 3]])
+            if i % 5 == 0:
+                await cache.delete(f"key{(i + 7) % 20}")
+            if i % 11 == 0:
+                await cache.invalidate_tag(tags[i % 3])
+            assert_tag_index_consistent(cache)
+
+        await asyncio.sleep(0.05)  # let all pending TTL timers fire
+        assert_tag_index_consistent(cache)
+        assert cache._tag_index == {}
+        assert cache._key_tags == {}

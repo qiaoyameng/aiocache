@@ -113,6 +113,8 @@ class BaseCache(Generic[CacheKeyType], ABC):
     """
 
     NAME: str
+    #: Whether the backend supports tagged writes and tag invalidation.
+    SUPPORTS_TAGS: bool = False
 
     def __init__(
         self,
@@ -262,7 +264,16 @@ class BaseCache(Generic[CacheKeyType], ABC):
     @API.timeout
     @API.plugins
     async def set(
-        self, key, value, ttl=SENTINEL, dumps_fn=None, namespace=None, _cas_token=None, _conn=None
+        self,
+        key,
+        value,
+        ttl=SENTINEL,
+        dumps_fn=None,
+        namespace=None,
+        tags=None,
+        _tags_version=None,
+        _cas_token=None,
+        _conn=None,
     ):
         """
         Stores the value in the given key with ttl if specified
@@ -274,18 +285,39 @@ class BaseCache(Generic[CacheKeyType], ABC):
             need miliseconds, valkey and memory support float ttls
         :param dumps_fn: callable alternative to use as dumps function
         :param namespace: str alternative namespace to use
+        :param tags: optional iterable of str tags to associate the key with, so it can
+            be evicted later with :meth:`BaseCache.invalidate_tag`. Only supported by
+            backends with ``SUPPORTS_TAGS = True`` (currently just the memory backend).
         :param timeout: int or float in seconds specifying maximum timeout
             for the operations to last
         :returns: True if the value was set
-        :raises: :class:`asyncio.TimeoutError` if it lasts more than self.timeout
+        :raises:
+            - :class:`asyncio.TimeoutError` if it lasts more than self.timeout
+            - :class:`NotImplementedError` if tags are given but the backend
+              does not support them
         """
         start = time.monotonic()
         dumps = dumps_fn or self.serializer.dumps
         ns_key = self.build_key(key, namespace)
 
-        res = await self._set(
-            ns_key, dumps(value), ttl=self._get_ttl(ttl), _cas_token=_cas_token, _conn=_conn
-        )
+        if tags is not None:
+            if not self.SUPPORTS_TAGS:
+                raise NotImplementedError(
+                    f"{type(self).__name__} cache backend does not support tagged caching"
+                )
+            res = await self._set(
+                ns_key,
+                dumps(value),
+                ttl=self._get_ttl(ttl),
+                tags=tags,
+                _tags_version=_tags_version,
+                _cas_token=_cas_token,
+                _conn=_conn,
+            )
+        else:
+            res = await self._set(
+                ns_key, dumps(value), ttl=self._get_ttl(ttl), _cas_token=_cas_token, _conn=_conn
+            )
 
         logger.debug("SET %s %d (%.4f)s", ns_key, True, time.monotonic() - start)
         return res
@@ -461,6 +493,19 @@ class BaseCache(Generic[CacheKeyType], ABC):
     @abstractmethod
     async def _clear(self, namespace, _conn=None):
         raise NotImplementedError()
+
+    async def invalidate_tag(self, tag):
+        """
+        Removes all keys associated with the given tag. Only supported by backends
+        with ``SUPPORTS_TAGS = True`` (currently just the memory backend).
+
+        :param tag: str tag to invalidate
+        :returns: number of keys removed
+        :raises: :class:`NotImplementedError` if the backend does not support tags
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} cache backend does not support tag invalidation"
+        )
 
     @API.register
     @API.aiocache_enabled()

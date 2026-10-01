@@ -11,6 +11,7 @@ from aiocache.backends.memory import SimpleMemoryCache
 from aiocache.base import SENTINEL
 from aiocache.decorators import _get_args_dict
 from aiocache.lock import RedLock
+from ..utils import ConcreteBaseCache
 
 
 async def stub(*args, value=None, seconds=0, **kwargs):
@@ -272,6 +273,93 @@ class TestCachedStampede:
 async def stub_dict(*args, keys=None, **kwargs):
     values = {"a": random.randint(1, 50), "b": random.randint(1, 50), "c": random.randint(1, 50)}
     return {k: values.get(k) for k in keys}
+
+
+class TestCachedTags:
+    @pytest.fixture
+    def cache(self):
+        return SimpleMemoryCache()
+
+    def test_tags_builder_requires_tag_support(self):
+        with pytest.raises(NotImplementedError, match="tagged caching"):
+            cached(ConcreteBaseCache(), tags_builder=lambda *args, **kwargs: [])
+
+    def test_tags_builder_accepted_for_memory(self, cache):
+        decorator = cached(cache, tags_builder=lambda *args, **kwargs: [])
+        assert decorator.tags_builder is not None
+
+    async def test_tags_built_from_args_and_result(self, cache):
+        @cached(
+            cache,
+            tags_builder=lambda f, sku, *, result: [f"sku:{sku}", f"region:{result['region']}"],
+        )
+        async def get_price(sku):
+            return {"price": 10, "region": "eu"}
+
+        assert await get_price("a1") == {"price": 10, "region": "eu"}
+
+        (key,) = list(cache._cache)
+        assert cache._tag_index == {"sku:a1": {key}, "region:eu": {key}}
+
+    async def test_invalidate_tag_forces_recompute(self, cache):
+        calls = 0
+
+        @cached(cache, tags_builder=lambda f, sku, *, result: [f"sku:{sku}"])
+        async def get_price(sku):
+            nonlocal calls
+            calls += 1
+            return calls
+
+        assert await get_price("a1") == 1
+        assert await get_price("a1") == 1
+
+        await cache.invalidate_tag("sku:a1")
+
+        assert await get_price("a1") == 2
+        assert await get_price("a1") == 2
+
+    async def test_invalidation_during_computation_is_not_reattached(self, cache):
+        started = asyncio.Event()
+        finish = asyncio.Event()
+
+        @cached(cache, tags_builder=lambda f, *, result: ["product"])
+        async def get_product():
+            started.set()
+            await finish.wait()
+            return "stale"
+
+        task = asyncio.create_task(get_product())
+        await started.wait()
+        await cache.invalidate_tag("product")
+        finish.set()
+
+        assert await task == "stale"
+        assert cache._cache == {}
+        assert cache._tag_index == {}
+
+    async def test_fresh_computation_after_invalidation_is_cached(self, cache):
+        calls = 0
+
+        @cached(cache, tags_builder=lambda f, *, result: ["product"])
+        async def get_product():
+            nonlocal calls
+            calls += 1
+            return calls
+
+        assert await get_product() == 1
+        await cache.invalidate_tag("product")
+        assert await get_product() == 2
+        assert await get_product() == 2
+        assert len(cache._tag_index["product"]) == 1
+
+    async def test_cached_stampede_writes_tags(self, cache):
+        @cached_stampede(cache, tags_builder=lambda f, *, result: ["product"])
+        async def get_product():
+            return "value"
+
+        assert await get_product() == "value"
+        (key,) = list(cache._cache)
+        assert cache._tag_index == {"product": {key}}
 
 
 class TestMultiCached:

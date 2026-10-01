@@ -23,6 +23,11 @@ class cached:
         wrapped function and should return `True` if the value should skip the
         cache (or `False` to store in the cache).
         e.g. to avoid caching `None` results: `lambda r: r is None`
+    :param tags_builder: Callable that decides the tags the cached result is stored
+        with. It receives the function, the same args and kwargs passed to the
+        function and the result as a ``result`` keyword argument, and must return
+        an iterable of str tags. Requires a cache backend with tag support
+        (``SUPPORTS_TAGS``), otherwise :class:`NotImplementedError` is raised.
     :param noself: bool if you are decorating a class function, by default self is also used to
         generate the key. This will result in same function calls done by different class instances
         to use different cache keys. Use noself=True if you want to ignore it.
@@ -35,11 +40,17 @@ class cached:
         ttl=SENTINEL,
         key_builder=None,
         skip_cache_func=lambda x: False,
+        tags_builder=None,
         noself=False,
     ):
         self.ttl = ttl
         self.key_builder = key_builder
         self.skip_cache_func = skip_cache_func
+        if tags_builder is not None and not getattr(cache, "SUPPORTS_TAGS", False):
+            raise NotImplementedError(
+                f"{type(cache).__name__} cache backend does not support tagged caching"
+            )
+        self.tags_builder = tags_builder
         self.noself = noself
         self.cache = cache
 
@@ -61,19 +72,32 @@ class cached:
             if value is not None:
                 return value
 
+        tags_version = self._get_tags_version()
         result = await f(*args, **kwargs)
 
         if self.skip_cache_func(result):
             return result
 
         if cache_write:
+            set_kwargs = self._build_set_kwargs(f, args, kwargs, result, tags_version)
             if aiocache_wait_for_write:
-                await self.set_in_cache(key, result)
+                await self.set_in_cache(key, result, **set_kwargs)
             else:
                 # TODO: Use aiojobs to avoid warnings.
-                asyncio.create_task(self.set_in_cache(key, result))
+                asyncio.create_task(self.set_in_cache(key, result, **set_kwargs))
 
         return result
+
+    def _get_tags_version(self):
+        if self.tags_builder is None:
+            return None
+        return self.cache.get_tags_version()
+
+    def _build_set_kwargs(self, f, args, kwargs, result, tags_version):
+        if self.tags_builder is None:
+            return {}
+        tags = self.tags_builder(f, *args, result=result, **kwargs)
+        return {"tags": tags, "tags_version": tags_version}
 
     def get_cache_key(self, f, args, kwargs):
         if self.key_builder:
@@ -97,9 +121,14 @@ class cached:
             logger.exception("Couldn't retrieve %s, unexpected error", key)
         return None
 
-    async def set_in_cache(self, key, value):
+    async def set_in_cache(self, key, value, tags=None, tags_version=None):
         try:
-            await self.cache.set(key, value, ttl=self.ttl)
+            if tags is not None:
+                await self.cache.set(
+                    key, value, ttl=self.ttl, tags=tags, _tags_version=tags_version
+                )
+            else:
+                await self.cache.set(key, value, ttl=self.ttl)
         except Exception:
             logger.exception("Couldn't set %s in key %s, unexpected error", value, key)
 
@@ -123,6 +152,8 @@ class cached_stampede(cached):
         wrapped function and should return `True` if the value should skip the
         cache (or `False` to store in the cache).
         e.g. to avoid caching `None` results: `lambda r: r is None`
+    :param tags_builder: Callable that decides the tags the cached result is stored
+        with. See :class:`aiocache.decorators.cached`.
     :param noself: bool if you are decorating a class function, by default self is also used to
         generate the key. This will result in same function calls done by different class instances
         to use different cache keys. Use noself=True if you want to ignore it.
@@ -144,12 +175,15 @@ class cached_stampede(cached):
             if value is not None:
                 return value
 
+            tags_version = self._get_tags_version()
             result = await f(*args, **kwargs)
 
             if self.skip_cache_func(result):
                 return result
 
-            await self.set_in_cache(key, result)
+            await self.set_in_cache(
+                key, result, **self._build_set_kwargs(f, args, kwargs, result, tags_version)
+            )
 
         return result
 

@@ -156,6 +156,15 @@ class TestBaseCache:
         with pytest.raises(NotImplementedError):
             await base_cache._set(Keys.KEY, "value", 0)
 
+    async def test_set_with_tags_not_supported(self, base_cache):
+        assert base_cache.SUPPORTS_TAGS is False
+        with pytest.raises(NotImplementedError, match="tagged caching"):
+            await base_cache.set(Keys.KEY, "value", tags=["t1"])
+
+    async def test_invalidate_tag_not_supported(self, base_cache):
+        with pytest.raises(NotImplementedError, match="tag invalidation"):
+            await base_cache.invalidate_tag("t1")
+
     async def test_multi_get(self, base_cache):
         with pytest.raises(NotImplementedError):
             await base_cache._multi_get([Keys.KEY], encoding="utf-8")

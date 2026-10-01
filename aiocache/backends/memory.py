@@ -24,6 +24,7 @@ class SimpleMemoryCache(BaseCache[str]):
     """
 
     NAME = "memory"
+    SUPPORTS_TAGS = True
 
     # TODO(PY312): https://peps.python.org/pep-0692/
     def __init__(self, **kwargs):
@@ -35,6 +36,45 @@ class SimpleMemoryCache(BaseCache[str]):
 
         self._cache: OrderedDict[str, object] = OrderedDict()
         self._handlers: dict[str, asyncio.TimerHandle] = {}
+        self._tag_index: dict[str, set[str]] = {}
+        self._key_tags: dict[str, set[str]] = {}
+        self._tags_version = 0
+        self._tag_invalidated_at: dict[str, int] = {}
+
+    def get_tags_version(self) -> int:
+        """Monotonic counter bumped on every tag invalidation.
+
+        Used to detect that a computation started before an invalidation, so its
+        result is not re-attached to the invalidated tags when written back.
+        """
+        return self._tags_version
+
+    def _index_key(self, key: str, tags) -> None:
+        tag_set = set(tags)
+        if not tag_set:
+            return
+        self._key_tags[key] = tag_set
+        for tag in tag_set:
+            self._tag_index.setdefault(tag, set()).add(key)
+
+    def _unindex_key(self, key: str) -> None:
+        tags = self._key_tags.pop(key, None)
+        if not tags:
+            return
+        for tag in tags:
+            keys = self._tag_index.get(tag)
+            if keys is not None:
+                keys.discard(key)
+                if not keys:
+                    del self._tag_index[tag]
+
+    async def invalidate_tag(self, tag):
+        self._tags_version += 1
+        self._tag_invalidated_at[tag] = self._tags_version
+        removed = 0
+        for key in list(self._tag_index.get(tag, ())):
+            removed += self.__delete(key)
+        return removed
 
     def _mark_accessed(self, key: str) -> None:
         """Move key to end to mark as recently used."""
@@ -48,6 +88,7 @@ class SimpleMemoryCache(BaseCache[str]):
 
         while len(self._cache) > self.maxsize:
             key, _ = self._cache.popitem(last=False)  # Remove LRU item
+            self._unindex_key(key)
             if key in self._handlers:
                 self._handlers[key].cancel()
                 del self._handlers[key]
@@ -62,15 +103,27 @@ class SimpleMemoryCache(BaseCache[str]):
     async def _multi_get(self, keys, encoding="utf-8", _conn=None):
         return [await self._get(key, encoding=encoding, _conn=_conn) for key in keys]
 
-    async def _set(self, key, value, ttl=None, _cas_token=None, _conn=None):
+    async def _set(
+        self, key, value, ttl=None, tags=None, _tags_version=None, _cas_token=None, _conn=None
+    ):
         if _cas_token is not None and self._cache.get(key) != _cas_token:
             return 0
+
+        if tags and _tags_version is not None:
+            invalidated_at = self._tag_invalidated_at
+            if any(invalidated_at.get(tag, 0) > _tags_version for tag in tags):
+                # The computation that produced this value started before one of
+                # its tags was invalidated; refuse to re-attach the stale result.
+                return False
 
         if key in self._handlers:
             self._handlers[key].cancel()
 
+        self._unindex_key(key)
         self._cache[key] = value
         self._cache.move_to_end(key)
+        if tags:
+            self._index_key(key, tags)
 
         if ttl:
             loop = asyncio.get_running_loop()
@@ -131,6 +184,8 @@ class SimpleMemoryCache(BaseCache[str]):
         else:
             self._cache = OrderedDict()
             self._handlers = {}
+            self._tag_index = {}
+            self._key_tags = {}
         return True
 
     async def _raw(self, command, *args, encoding="utf-8", _conn=None, **kwargs):
@@ -143,6 +198,7 @@ class SimpleMemoryCache(BaseCache[str]):
 
     def __delete(self, key):
         if self._cache.pop(key, None) is not None:
+            self._unindex_key(key)
             handle = self._handlers.pop(key, None)
             if handle:
                 handle.cancel()
