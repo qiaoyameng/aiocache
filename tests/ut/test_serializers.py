@@ -6,11 +6,16 @@ import pytest
 
 from aiocache.serializers import (
     BaseSerializer,
+    CorruptedPayloadError,
     JsonSerializer,
+    MigrationCycleError,
+    MissingMigrationStep,
     MsgPackSerializer,
     NullSerializer,
     PickleSerializer,
     StringSerializer,
+    UnknownVersionError,
+    VersionedSerializer,
 )
 
 Dummy = namedtuple("Dummy", "a, b")
@@ -173,3 +178,174 @@ class TestMsgPackSerializer:
             "a": [1, 2, ["1", 2]],
             "b": {"b": 1, "c": [1, 2]},
         }
+
+
+class TestVersionedSerializer:
+    def test_wraps_current_value(self):
+        serializer = VersionedSerializer(version=2)
+
+        raw = serializer.dumps("value")
+
+        assert raw == {
+            "__aiocache_format__": "aiocache.versioned",
+            "version": 2,
+            "payload": "value",
+        }
+        assert serializer.loads(raw) == "value"
+
+    def test_inner_serializer_is_used_for_envelope(self):
+        serializer = VersionedSerializer(JsonSerializer(), version=2)
+
+        raw = serializer.dumps("value")
+
+        assert isinstance(raw, str)
+        assert serializer.loads(raw) == "value"
+
+    def test_reads_legacy_unwrapped_payload(self):
+        serializer = VersionedSerializer(
+            version=2,
+            migrations={1: lambda payload: f"{payload}-v2"},
+        )
+
+        assert serializer.loads("legacy") == "legacy-v2"
+
+    def test_migrates_multiple_versions(self):
+        serializer = VersionedSerializer(
+            version=3,
+            migrations={
+                1: lambda payload: payload + 1,
+                2: lambda payload: payload * 2,
+            },
+        )
+        raw = {
+            "__aiocache_format__": "aiocache.versioned",
+            "version": 1,
+            "payload": 1,
+        }
+
+        assert serializer.loads(raw) == 4
+
+    def test_explicit_migration_registry_skips_version(self):
+        serializer = VersionedSerializer(
+            version=3,
+            migrations={(1, 3): lambda payload: payload + 3},
+        )
+
+        assert serializer.loads(serializer._make_envelope(1, 1)) == 4
+        assert serializer.loads(serializer._make_envelope(3, 1)) == 1
+
+    async def test_supports_async_migration_functions(self):
+        async def migrate(payload):
+            return payload + 1
+
+        serializer = VersionedSerializer(version=2, migrations={1: migrate})
+        raw = serializer._make_envelope(1, 1)
+
+        assert await serializer.aloads(raw) == 2
+
+    def test_same_instance_reads_different_versions(self):
+        serializer = VersionedSerializer(
+            version=3,
+            migrations={
+                1: lambda payload: payload + 1,
+                2: lambda payload: payload + 2,
+            },
+        )
+
+        assert serializer.loads(serializer._make_envelope(1, 0)) == 3
+        assert serializer.loads(serializer._make_envelope(2, 0)) == 2
+        assert serializer.loads(serializer._make_envelope(3, 0)) == 0
+
+    def test_incomplete_registry_is_rejected(self):
+        with pytest.raises(MissingMigrationStep):
+            VersionedSerializer(
+                version=3,
+                migrations={1: lambda payload: payload},
+            )
+
+    def test_missing_migration_step(self):
+        serializer = VersionedSerializer(
+            version=3,
+            migrations={2: lambda payload: payload},
+        )
+
+        with pytest.raises(MissingMigrationStep):
+            serializer.loads(serializer._make_envelope(1, None))
+
+    def test_unknown_newer_version(self):
+        serializer = VersionedSerializer(version=2)
+
+        with pytest.raises(UnknownVersionError):
+            serializer.loads(serializer._make_envelope(3, None))
+
+    def test_registry_cycle_is_rejected(self):
+        with pytest.raises(MigrationCycleError):
+            VersionedSerializer(
+                version=3,
+                migrations={
+                    1: (2, lambda payload: payload),
+                    2: (1, lambda payload: payload),
+                },
+            )
+
+    def test_indirect_registry_cycle_is_rejected(self):
+        with pytest.raises(MigrationCycleError):
+            VersionedSerializer(
+                version=4,
+                migrations={
+                    1: (2, lambda payload: payload),
+                    2: (3, lambda payload: payload),
+                    3: (1, lambda payload: payload),
+                },
+            )
+
+    def test_corrupted_envelope(self):
+        serializer = VersionedSerializer(JsonSerializer(), version=2)
+
+        with pytest.raises(CorruptedPayloadError):
+            serializer.loads("not-json")
+
+    def test_missing_payload_is_corrupted(self):
+        serializer = VersionedSerializer(version=2)
+
+        with pytest.raises(CorruptedPayloadError):
+            serializer.loads(
+                {
+                    "__aiocache_format__": "aiocache.versioned",
+                    "version": 2,
+                }
+            )
+
+    def test_invalid_version_is_corrupted(self):
+        serializer = VersionedSerializer(version=2)
+
+        with pytest.raises(CorruptedPayloadError):
+            serializer.loads(
+                {
+                    "__aiocache_format__": "aiocache.versioned",
+                    "version": "2",
+                    "payload": None,
+                }
+            )
+
+    def test_failed_migration_is_corrupted_payload(self):
+        def migrate(payload):
+            raise ValueError("bad payload")
+
+        serializer = VersionedSerializer(version=2, migrations={1: migrate})
+
+        with pytest.raises(CorruptedPayloadError):
+            serializer.loads(serializer._make_envelope(1, None))
+
+    def test_migration_receives_a_copy(self):
+        payload = {"values": [1]}
+
+        def migrate(value):
+            value["values"].append(2)
+            return value
+
+        serializer = VersionedSerializer(version=2, migrations={1: migrate})
+        raw = serializer._make_envelope(1, payload)
+
+        assert serializer.loads(raw) == {"values": [1, 2]}
+        assert payload == {"values": [1]}

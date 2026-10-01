@@ -1,13 +1,18 @@
 import asyncio
 import pickle
-from unittest.mock import ANY, MagicMock, create_autospec, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, create_autospec, patch
 
 import pytest
 
 from aiocache.backends.memory import SimpleMemoryCache
 from aiocache.base import BaseCache
-from aiocache.serializers import NullSerializer, PickleSerializer
-from ...utils import Keys
+from aiocache.serializers import (
+    NullSerializer,
+    PickleSerializer,
+    ReadRepairUnsupportedError,
+    VersionedSerializer,
+)
+from ...utils import ConcreteBaseCache, Keys
 
 
 @pytest.fixture
@@ -382,3 +387,289 @@ class TestSimpleMemoryCache:
             assert isinstance(smc.serializer, PickleSerializer)
             await smc.set(Keys.KEY, value)
             assert await smc.get(Keys.KEY) == pickle.loads(serialized)
+
+
+class BarrierVersionedSerializer(VersionedSerializer):
+    def __init__(self, *args, after_read=None, before_write=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._after_read_callback = after_read
+        self._before_write_callback = before_write
+
+    async def _after_raw_read(self, key, raw):
+        if self._after_read_callback is not None:
+            await self._after_read_callback(key, raw)
+
+    async def _before_conditional_write(self, key, value):
+        if self._before_write_callback is not None:
+            await self._before_write_callback(key, value)
+
+
+class TestVersionedReadRepair:
+    async def test_read_repairs_old_value(self):
+        serializer = VersionedSerializer(
+            version=2,
+            read_repair=True,
+            migrations={1: lambda payload: f"{payload}-v2"},
+        )
+        cache = SimpleMemoryCache(serializer=serializer)
+        cache._cache[Keys.KEY] = serializer._make_envelope(1, "old")
+
+        assert await cache.get(Keys.KEY) == "old-v2"
+
+        raw = cache._cache[Keys.KEY]
+        assert raw["version"] == 2
+        assert raw["payload"] == "old-v2"
+
+    async def test_read_repair_keeps_cache_key(self):
+        serializer = VersionedSerializer(version=2, read_repair=True)
+        cache = SimpleMemoryCache(serializer=serializer)
+        cache._cache["prefix-key"] = serializer._make_envelope(2, "value")
+
+        assert await cache.get("key", namespace="prefix-") == "value"
+        assert set(cache._cache) == {"prefix-key"}
+
+    async def test_read_only_without_repair(self):
+        serializer = VersionedSerializer(
+            version=2,
+            migrations={1: lambda payload: f"{payload}-v2"},
+        )
+        cache = SimpleMemoryCache(serializer=serializer)
+        old_value = serializer._make_envelope(1, "old")
+        cache._cache[Keys.KEY] = old_value
+
+        assert await cache.get(Keys.KEY) == "old-v2"
+        assert cache._cache[Keys.KEY] is old_value
+
+    async def test_read_repairs_multiple_steps(self):
+        serializer = VersionedSerializer(
+            version=3,
+            read_repair=True,
+            migrations={
+                1: lambda payload: payload + 1,
+                2: lambda payload: payload * 2,
+            },
+        )
+        cache = SimpleMemoryCache(serializer=serializer)
+        cache._cache[Keys.KEY] = serializer._make_envelope(1, 1)
+
+        assert await cache.get(Keys.KEY) == 4
+        assert cache._cache[Keys.KEY] == serializer._make_envelope(3, 4)
+
+    async def test_failed_migration_leaves_old_entry(self):
+        def migrate(payload):
+            raise ValueError("bad payload")
+
+        serializer = VersionedSerializer(
+            version=2,
+            read_repair=True,
+            migrations={1: migrate},
+        )
+        cache = SimpleMemoryCache(serializer=serializer)
+        old_value = serializer._make_envelope(1, "old")
+        cache._cache[Keys.KEY] = old_value
+
+        with pytest.raises(ValueError):
+            await cache.get(Keys.KEY)
+
+        assert cache._cache[Keys.KEY] is old_value
+
+    async def test_migration_does_not_mutate_stored_old_entry(self):
+        def migrate(payload):
+            payload["value"] = 2
+            return payload
+
+        serializer = VersionedSerializer(
+            version=2,
+            read_repair=True,
+            migrations={1: migrate},
+        )
+        cache = SimpleMemoryCache(serializer=serializer)
+        old_value = serializer._make_envelope(1, {"value": 1})
+        cache._cache[Keys.KEY] = old_value
+
+        await cache.get(Keys.KEY)
+
+        assert old_value["payload"] == {"value": 1}
+
+    async def test_read_repair_preserves_remaining_ttl(self):
+        started = asyncio.Event()
+        finished = asyncio.Event()
+
+        async def migrate(payload):
+            started.set()
+            await finished.wait()
+            return f"{payload}-v2"
+
+        serializer = BarrierVersionedSerializer(
+            version=2,
+            read_repair=True,
+            migrations={1: migrate},
+        )
+        cache = SimpleMemoryCache(serializer=serializer)
+        cache._cache[Keys.KEY] = serializer._make_envelope(1, "old")
+        cache._store(Keys.KEY, cache._cache[Keys.KEY], ttl=100)
+
+        get_task = asyncio.create_task(cache.get(Keys.KEY))
+        await started.wait()
+        old_handler = cache._handlers[Keys.KEY]
+        await asyncio.sleep(0.02)
+        finished.set()
+
+        assert await get_task == "old-v2"
+        assert cache._handlers[Keys.KEY] is old_handler
+        loop = asyncio.get_running_loop()
+        remaining = cache._expires_at[Keys.KEY] - loop.time()
+        assert remaining == pytest.approx(99.98, abs=0.05)
+
+    async def test_zero_remaining_time_during_migration(self):
+        started = asyncio.Event()
+        finished = asyncio.Event()
+
+        async def migrate(payload):
+            started.set()
+            await finished.wait()
+            return payload
+
+        serializer = BarrierVersionedSerializer(
+            version=2,
+            read_repair=True,
+            migrations={1: migrate},
+        )
+        cache = SimpleMemoryCache(serializer=serializer)
+        cache._cache[Keys.KEY] = serializer._make_envelope(1, "old")
+        cache._store(Keys.KEY, cache._cache[Keys.KEY], ttl=0.01)
+
+        get_task = asyncio.create_task(cache.get(Keys.KEY))
+        await started.wait()
+        await asyncio.sleep(0.025)
+        assert Keys.KEY not in cache._cache
+        finished.set()
+
+        assert await get_task == "old"
+        assert Keys.KEY not in cache._cache
+
+    @pytest.mark.parametrize("concurrent_operation", ("set", "delete"))
+    async def test_concurrent_change_between_migration_and_write(self, concurrent_operation):
+        reached_write = asyncio.Event()
+        release_write = asyncio.Event()
+        write_attempts = []
+
+        async def before_write(key, value):
+            reached_write.set()
+            write_attempts.append(await release_write.wait())
+
+        serializer = BarrierVersionedSerializer(
+            version=2,
+            read_repair=True,
+            migrations={1: lambda payload: f"{payload}-v2"},
+            before_write=before_write,
+        )
+        cache = SimpleMemoryCache(serializer=serializer)
+        cache._cache[Keys.KEY] = serializer._make_envelope(1, "old")
+        cache._store(Keys.KEY, cache._cache[Keys.KEY], ttl=100)
+        old_handler = cache._handlers[Keys.KEY]
+        repair_results = []
+        original_read_repair_set = cache._read_repair_set
+
+        async def record_read_repair_set(*args, **kwargs):
+            result = await original_read_repair_set(*args, **kwargs)
+            repair_results.append(result)
+            return result
+
+        cache._read_repair_set = record_read_repair_set
+
+        get_task = asyncio.create_task(cache.get(Keys.KEY))
+        await reached_write.wait()
+
+        if concurrent_operation == "set":
+            await cache.set(Keys.KEY, "newer", ttl=1)
+            expected_handler = cache._handlers[Keys.KEY]
+            assert expected_handler is not old_handler
+        else:
+            await cache.delete(Keys.KEY)
+            expected_handler = None
+
+        release_write.set()
+        assert await get_task == "old-v2"
+        assert write_attempts == [True]
+        assert repair_results == [0]
+
+        if concurrent_operation == "set":
+            assert cache._cache[Keys.KEY] == serializer._make_envelope(2, "newer")
+            assert cache._handlers[Keys.KEY] is expected_handler
+            loop = asyncio.get_running_loop()
+            remaining = cache._expires_at[Keys.KEY] - loop.time()
+            assert remaining == pytest.approx(1, abs=0.05)
+        else:
+            assert Keys.KEY not in cache._cache
+            assert Keys.KEY not in cache._handlers
+
+    @pytest.mark.parametrize("concurrent_operation", ("set", "delete"))
+    async def test_concurrent_change_between_read_and_migration(self, concurrent_operation):
+        reached_read = asyncio.Event()
+        release_read = asyncio.Event()
+        repair_results = []
+
+        async def after_read(key, raw):
+            reached_read.set()
+            await release_read.wait()
+
+        serializer = BarrierVersionedSerializer(
+            version=2,
+            read_repair=True,
+            migrations={1: lambda payload: f"{payload}-v2"},
+            after_read=after_read,
+        )
+        cache = SimpleMemoryCache(serializer=serializer)
+        cache._cache[Keys.KEY] = serializer._make_envelope(1, "old")
+        original_read_repair_set = cache._read_repair_set
+
+        async def record_read_repair_set(*args, **kwargs):
+            result = await original_read_repair_set(*args, **kwargs)
+            repair_results.append(result)
+            return result
+
+        cache._read_repair_set = record_read_repair_set
+
+        get_task = asyncio.create_task(cache.get(Keys.KEY))
+        await reached_read.wait()
+
+        if concurrent_operation == "set":
+            await cache.set(Keys.KEY, "newer", ttl=1)
+        else:
+            await cache.delete(Keys.KEY)
+
+        release_read.set()
+
+        assert await get_task == "old-v2"
+        assert repair_results == [0]
+
+        if concurrent_operation == "set":
+            loop = asyncio.get_running_loop()
+            remaining = cache._expires_at[Keys.KEY] - loop.time()
+            assert cache._cache[Keys.KEY] == serializer._make_envelope(2, "newer")
+            assert remaining == pytest.approx(1, abs=0.05)
+        else:
+            assert Keys.KEY not in cache._cache
+
+    async def test_read_repair_explicitly_unsupported_for_other_backends(self):
+        serializer = VersionedSerializer(
+            version=2,
+            read_repair=True,
+            migrations={1: lambda payload: payload},
+        )
+        cache = ConcreteBaseCache(serializer=serializer)
+
+        with pytest.raises(ReadRepairUnsupportedError):
+            await cache.get(Keys.KEY)
+
+    async def test_other_backends_still_read_without_repair(self):
+        serializer = VersionedSerializer(
+            version=2,
+            migrations={1: lambda payload: f"{payload}-v2"},
+        )
+        raw = serializer._make_envelope(1, "old")
+        cache = ConcreteBaseCache(serializer=serializer)
+        cache._get = AsyncMock(return_value=raw)
+
+        assert await cache.get(Keys.KEY) == "old-v2"

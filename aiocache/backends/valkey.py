@@ -42,6 +42,7 @@ class ValkeyCache(BaseCache[str]):
     """
 
     NAME = "valkey"
+    SUPPORTS_READ_REPAIR = False
 
     def __init__(
         self, config: GlideClientConfiguration, **kwargs

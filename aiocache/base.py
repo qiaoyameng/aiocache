@@ -8,7 +8,7 @@ from enum import Enum
 from types import TracebackType
 from typing import Callable, Generic, List, Optional, Set, TYPE_CHECKING, Type, TypeVar
 
-from aiocache.serializers import StringSerializer
+from aiocache.serializers import ReadRepairUnsupportedError, StringSerializer
 
 if TYPE_CHECKING:  # pragma: no cover
     from aiocache.plugins import BasePlugin
@@ -113,6 +113,7 @@ class BaseCache(Generic[CacheKeyType], ABC):
     """
 
     NAME: str
+    SUPPORTS_READ_REPAIR = False
 
     def __init__(
         self,
@@ -205,7 +206,24 @@ class BaseCache(Generic[CacheKeyType], ABC):
         loads = loads_fn or self.serializer.loads
         ns_key = self.build_key(key, namespace)
 
-        value = loads(await self._get(ns_key, encoding=self.serializer.encoding, _conn=_conn))
+        read_hook = getattr(self.serializer, "_aiocache_read", None)
+        if loads_fn is None and callable(read_hook):
+            token = None
+            read_repair = getattr(self.serializer, "read_repair", False)
+            if read_repair:
+                if not self.SUPPORTS_READ_REPAIR:
+                    raise ReadRepairUnsupportedError("This backend does not support read repair")
+                raw_value, token = await self._read_repair_record(
+                    ns_key, encoding=self.serializer.encoding, _conn=_conn
+                )
+            else:
+                raw_value = await self._get(
+                    ns_key, encoding=self.serializer.encoding, _conn=_conn
+                )
+            value = await read_hook(self, ns_key, raw_value, token, default, _conn)
+        else:
+            raw_value = await self._get(ns_key, encoding=self.serializer.encoding, _conn=_conn)
+            value = loads(raw_value)
 
         logger.debug("GET %s %s (%.4f)s", ns_key, value is not None, time.monotonic() - start)
         return value if value is not None else default
@@ -217,6 +235,12 @@ class BaseCache(Generic[CacheKeyType], ABC):
     @abstractmethod
     async def _gets(self, key, encoding="utf-8", _conn=None):
         raise NotImplementedError()
+
+    async def _read_repair_record(self, key, encoding, _conn=None):
+        raise NotImplementedError("This backend does not support read repair")
+
+    async def _read_repair_set(self, key, value, token, _conn=None):
+        raise NotImplementedError("This backend does not support read repair")
 
     @API.register
     @API.aiocache_enabled(fake_return=[])
@@ -238,12 +262,15 @@ class BaseCache(Generic[CacheKeyType], ABC):
         loads = loads_fn or self.serializer.loads
 
         ns_keys = [self.build_key(key, namespace) for key in keys]
-        values = [
-            loads(value)
-            for value in await self._multi_get(
-                ns_keys, encoding=self.serializer.encoding, _conn=_conn
-            )
-        ]
+        raw_values = await self._multi_get(
+            ns_keys, encoding=self.serializer.encoding, _conn=_conn
+        )
+        values = []
+        for value in raw_values:
+            if loads_fn is None:
+                values.append(await self.serializer.aloads(value))
+            else:
+                values.append(loads(value))
 
         logger.debug(
             "MULTI_GET %s %d (%.4f)s",

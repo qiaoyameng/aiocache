@@ -24,6 +24,7 @@ class SimpleMemoryCache(BaseCache[str]):
     """
 
     NAME = "memory"
+    SUPPORTS_READ_REPAIR = True
 
     # TODO(PY312): https://peps.python.org/pep-0692/
     def __init__(self, **kwargs):
@@ -35,6 +36,9 @@ class SimpleMemoryCache(BaseCache[str]):
 
         self._cache: OrderedDict[str, object] = OrderedDict()
         self._handlers: dict[str, asyncio.TimerHandle] = {}
+        self._expires_at: dict[str, float] = {}
+        self._versions: dict[str, int] = {}
+        self._next_version = 1
 
     def _mark_accessed(self, key: str) -> None:
         """Move key to end to mark as recently used."""
@@ -51,6 +55,28 @@ class SimpleMemoryCache(BaseCache[str]):
             if key in self._handlers:
                 self._handlers[key].cancel()
                 del self._handlers[key]
+            self._expires_at.pop(key, None)
+            self._versions.pop(key, None)
+
+    def _store(self, key: str, value: object, ttl: Optional[float] = None) -> None:
+        self._next_version += 1
+        self._versions[key] = self._next_version
+        self._cache[key] = value
+        self._cache.move_to_end(key)
+
+        if key in self._handlers:
+            self._handlers[key].cancel()
+            self._handlers.pop(key, None)
+
+        if ttl:
+            loop = asyncio.get_running_loop()
+            expires_at = loop.time() + ttl
+            self._expires_at[key] = expires_at
+            self._handlers[key] = loop.call_at(expires_at, self.__delete, key)
+        else:
+            self._expires_at.pop(key, None)
+
+        self._evict_if_needed()
 
     async def _get(self, key, encoding="utf-8", _conn=None):
         self._mark_accessed(key)
@@ -59,6 +85,22 @@ class SimpleMemoryCache(BaseCache[str]):
     async def _gets(self, key, encoding="utf-8", _conn=None):
         return await self._get(key, encoding=encoding, _conn=_conn)
 
+    async def _read_repair_record(self, key, encoding="utf-8", _conn=None):
+        self._mark_accessed(key)
+        if key not in self._cache:
+            return None, None
+        return self._cache[key], self._versions.get(key, 1)
+
+    async def _read_repair_set(self, key, value, token, _conn=None):
+        if key not in self._cache or self._versions.get(key, 1) != token:
+            return 0
+
+        self._next_version += 1
+        self._versions[key] = self._next_version
+        self._cache[key] = value
+        self._cache.move_to_end(key)
+        return True
+
     async def _multi_get(self, keys, encoding="utf-8", _conn=None):
         return [await self._get(key, encoding=encoding, _conn=_conn) for key in keys]
 
@@ -66,18 +108,7 @@ class SimpleMemoryCache(BaseCache[str]):
         if _cas_token is not None and self._cache.get(key) != _cas_token:
             return 0
 
-        if key in self._handlers:
-            self._handlers[key].cancel()
-
-        self._cache[key] = value
-        self._cache.move_to_end(key)
-
-        if ttl:
-            loop = asyncio.get_running_loop()
-            self._handlers[key] = loop.call_later(ttl, self.__delete, key)
-
-        # Evict the oldest items if over limit
-        self._evict_if_needed()
+        self._store(key, value, ttl=ttl)
         return True
 
     async def _multi_set(self, pairs, ttl=None, _conn=None):
@@ -95,13 +126,13 @@ class SimpleMemoryCache(BaseCache[str]):
 
     async def _increment(self, key, delta, _conn=None):
         if key not in self._cache:
-            self._cache[key] = delta
+            self._store(key, delta)
         else:
             try:
-                self._cache[key] = int(self._cache[key]) + delta
+                value = int(self._cache[key]) + delta
             except ValueError:
                 raise TypeError("Value is not an integer") from None
-        self._mark_accessed(key)
+            self._store(key, value)
         return self._cache[key]
 
     async def _expire(self, key, ttl, _conn=None):
@@ -115,7 +146,11 @@ class SimpleMemoryCache(BaseCache[str]):
         # Set new timer
         if ttl:
             loop = asyncio.get_running_loop()
-            self._handlers[key] = loop.call_later(ttl, self.__delete, key)
+            expires_at = loop.time() + ttl
+            self._expires_at[key] = expires_at
+            self._handlers[key] = loop.call_at(expires_at, self.__delete, key)
+        else:
+            self._expires_at.pop(key, None)
 
         self._mark_accessed(key)
         return True
@@ -131,6 +166,8 @@ class SimpleMemoryCache(BaseCache[str]):
         else:
             self._cache = OrderedDict()
             self._handlers = {}
+            self._expires_at = {}
+            self._versions = {}
         return True
 
     async def _raw(self, command, *args, encoding="utf-8", _conn=None, **kwargs):
@@ -146,6 +183,8 @@ class SimpleMemoryCache(BaseCache[str]):
             handle = self._handlers.pop(key, None)
             if handle:
                 handle.cancel()
+            self._expires_at.pop(key, None)
+            self._versions.pop(key, None)
             return 1
 
         return 0

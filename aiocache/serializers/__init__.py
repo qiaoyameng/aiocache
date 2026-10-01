@@ -2,10 +2,18 @@ import logging
 
 from .serializers import (
     BaseSerializer,
+    CorruptedPayloadError,
     JsonSerializer,
+    MigrationCycleError,
+    MigrationRegistryError,
+    MigrationTarget,
+    MissingMigrationStep,
     NullSerializer,
     PickleSerializer,
+    ReadRepairUnsupportedError,
     StringSerializer,
+    UnknownVersionError,
+    VersionedSerializer,
 )
 
 logger = logging.getLogger(__name__)
@@ -28,4 +36,12 @@ __all__ = [
     "PickleSerializer",
     "JsonSerializer",
     "MsgPackSerializer",
+    "VersionedSerializer",
+    "MigrationRegistryError",
+    "MigrationCycleError",
+    "MissingMigrationStep",
+    "UnknownVersionError",
+    "CorruptedPayloadError",
+    "ReadRepairUnsupportedError",
+    "MigrationTarget",
 ]

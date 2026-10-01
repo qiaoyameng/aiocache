@@ -27,6 +27,7 @@ class MemcachedCache(BaseCache[bytes]):
     """
 
     NAME = "memcached"
+    SUPPORTS_READ_REPAIR = False
 
     def __init__(self, host="127.0.0.1", port=11211, pool_size=2, **kwargs):
         if "serializer" not in kwargs:
