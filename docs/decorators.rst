@@ -28,3 +28,15 @@ multi_cached
 .. literalinclude:: ../examples/multicached_decorator.py
   :language: python
   :linenos:
+
+..  _cached_swr:
+
+cached_swr
+----------
+
+.. automodule:: aiocache
+  :members: cached_swr
+
+.. literalinclude:: ../examples/cached_swr_decorator.py
+  :language: python
+  :linenos:

@@ -6,11 +6,12 @@ from unittest.mock import ANY, create_autospec, patch
 
 import pytest
 
-from aiocache import cached, cached_stampede, multi_cached
+from aiocache import cached, cached_stampede, cached_swr, multi_cached
 from aiocache.backends.memory import SimpleMemoryCache
 from aiocache.base import SENTINEL
 from aiocache.decorators import _get_args_dict
 from aiocache.lock import RedLock
+from aiocache.serializers import JsonSerializer
 
 
 async def stub(*args, value=None, seconds=0, **kwargs):
@@ -272,6 +273,288 @@ class TestCachedStampede:
 async def stub_dict(*args, keys=None, **kwargs):
     values = {"a": random.randint(1, 50), "b": random.randint(1, 50), "c": random.randint(1, 50)}
     return {k: values.get(k) for k in keys}
+
+
+class FakeClock:
+    def __init__(self, start=1000.0):
+        self.now = start
+
+    def __call__(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += seconds
+
+
+class TestCachedSWR:
+    @pytest.fixture
+    def clock(self):
+        return FakeClock()
+
+    @pytest.fixture
+    def cache(self):
+        return SimpleMemoryCache()
+
+    @pytest.fixture
+    def decorator(self, cache, clock):
+        return cached_swr(cache=cache, soft_ttl=10, hard_ttl=20, time_func=clock)
+
+    @pytest.fixture
+    def counter(self):
+        def factory(return_value=None, side_effect=None):
+            calls = 0
+
+            async def fn():
+                nonlocal calls
+                calls += 1
+                if fn.side_effect is not None and calls > 1:
+                    raise fn.side_effect
+                return f"{return_value or 'v'}{calls}"
+
+            fn.side_effect = side_effect
+            fn.calls = lambda: calls
+            return fn
+
+        return factory
+
+    async def settle(self, decorator):
+        while decorator._refreshing:
+            await asyncio.gather(*decorator._refreshing.values(), return_exceptions=True)
+            await asyncio.sleep(0)
+
+    def test_inheritance(self, cache):
+        assert isinstance(cached_swr(cache=cache, soft_ttl=1), cached)
+
+    def test_init(self, cache, clock):
+        c = cached_swr(cache=cache, soft_ttl=10, hard_ttl=20, time_func=clock)
+
+        assert c.soft_ttl == 10
+        assert c.hard_ttl == 20
+        assert c.ttl == 20
+        assert c.time_func is clock
+        assert c.cache is cache
+
+    def test_init_defaults(self, cache):
+        c = cached_swr(cache=cache, soft_ttl=10)
+
+        assert c.hard_ttl is None
+        assert c.ttl is None
+
+    @pytest.mark.parametrize("soft_ttl, hard_ttl", [(0, None), (-1, None), (10, 10), (10, 5)])
+    def test_init_invalid_ttls(self, cache, soft_ttl, hard_ttl):
+        with pytest.raises(ValueError):
+            cached_swr(cache=cache, soft_ttl=soft_ttl, hard_ttl=hard_ttl)
+
+    async def test_wrapper_exposes_cache_and_close(self, decorator):
+        async def fn():
+            return 1
+
+        wrapped = decorator(fn)
+        assert wrapped.cache is decorator.cache
+        assert wrapped.close == decorator.close
+
+    async def test_fresh_phase(self, decorator, counter):
+        fn = counter()
+        cached_fn = decorator(fn)
+
+        assert await cached_fn() == "v1"
+        assert await cached_fn() == "v1"
+        assert fn.calls() == 1
+
+    async def test_stale_phase_single_background_refresh(self, decorator, clock, counter):
+        fn = counter()
+        cached_fn = decorator(fn)
+        assert await cached_fn() == "v1"
+
+        clock.advance(15)  # soft expired, still within hard ttl
+        results = await asyncio.gather(cached_fn(), cached_fn(), cached_fn())
+
+        assert results == ["v1", "v1", "v1"]  # stale served immediately
+        await self.settle(decorator)
+        assert fn.calls() == 2  # only one refresh for the cache instance + key
+        assert await cached_fn() == "v2"
+
+    async def test_hard_expired_phase_waits_for_refresh(self, decorator, clock, counter):
+        fn = counter()
+        cached_fn = decorator(fn)
+        assert await cached_fn() == "v1"
+
+        clock.advance(25)  # beyond hard ttl: must wait for a fresh result
+        assert await cached_fn() == "v2"
+        assert fn.calls() == 2
+
+    async def test_hard_expired_refresh_failure_never_serves_stale(
+        self, decorator, clock, counter
+    ):
+        fn = counter(side_effect=ValueError("boom"))
+        cached_fn = decorator(fn)
+        assert await cached_fn() == "v1"
+
+        clock.advance(25)
+        with pytest.raises(ValueError, match="boom"):
+            await cached_fn()
+
+    async def test_failed_refresh_releases_slot(self, decorator, clock, counter):
+        fn = counter(side_effect=ValueError("boom"))
+        cached_fn = decorator(fn)
+        assert await cached_fn() == "v1"
+
+        clock.advance(25)
+        with pytest.raises(ValueError, match="boom"):
+            await cached_fn()
+        assert decorator._refreshing == {}
+
+        fn.side_effect = None
+        assert await cached_fn() == "v3"
+
+    async def test_stale_served_while_background_refresh_fails(
+        self, decorator, clock, counter
+    ):
+        fn = counter(side_effect=ValueError("boom"))
+        cached_fn = decorator(fn)
+        assert await cached_fn() == "v1"
+
+        clock.advance(15)
+        assert await cached_fn() == "v1"  # stale still served, refresh fails in background
+        await self.settle(decorator)
+        assert decorator._refreshing == {}  # failure did not hold the refresh slot
+
+        assert await cached_fn() == "v1"  # next read retries the refresh
+        await self.settle(decorator)
+        assert fn.calls() == 3
+
+    async def test_concurrent_hard_miss_shares_one_refresh(self, decorator, clock):
+        started = asyncio.Event()
+        release = asyncio.Event()
+        calls = 0
+
+        async def fn():
+            nonlocal calls
+            calls += 1
+            started.set()
+            await release.wait()
+            return "fresh"
+
+        cached_fn = decorator(fn)
+        first = asyncio.ensure_future(cached_fn())
+        await started.wait()
+        second = asyncio.ensure_future(cached_fn())
+        await asyncio.sleep(0)
+
+        release.set()
+        assert await asyncio.gather(first, second) == ["fresh", "fresh"]
+        assert calls == 1
+
+    async def test_waiter_cancellation_keeps_shared_refresh(self, decorator, clock):
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def fn():
+            started.set()
+            await release.wait()
+            return "fresh"
+
+        cached_fn = decorator(fn)
+        cancelled_waiter = asyncio.ensure_future(cached_fn())
+        await started.wait()
+        survivor = asyncio.ensure_future(cached_fn())
+        await asyncio.sleep(0)
+
+        cancelled_waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await cancelled_waiter
+
+        release.set()
+        assert await survivor == "fresh"  # shared refresh was not cancelled
+        assert await cached_fn() == "fresh"  # and it populated the cache
+
+    async def test_close_reclaims_inflight_refresh(self, decorator, clock):
+        started = asyncio.Event()
+        release = asyncio.Event()
+        calls = 0
+
+        async def fn():
+            nonlocal calls
+            calls += 1
+            started.set()
+            await release.wait()
+            return "fresh"
+
+        cached_fn = decorator(fn)
+        pending = asyncio.ensure_future(cached_fn())
+        await started.wait()
+
+        await decorator.close()  # closing reclaims the background refresh
+        assert decorator._refreshing == {}
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+
+        release.set()
+        assert await cached_fn() == "fresh"  # no dangling refresh state inherited
+        assert calls == 2
+
+    async def test_close_without_inflight_refresh(self, decorator):
+        await decorator.close()
+        assert decorator._refreshing == {}
+
+    async def test_cache_read_false_bypasses_and_rewrites(self, decorator, counter):
+        fn = counter()
+        cached_fn = decorator(fn)
+
+        assert await cached_fn() == "v1"
+        assert await cached_fn(cache_read=False) == "v2"
+        assert await cached_fn() == "v2"
+        assert fn.calls() == 2
+
+    async def test_cache_write_false_never_stores_nor_refreshes(
+        self, decorator, clock, counter
+    ):
+        fn = counter()
+        cached_fn = decorator(fn)
+
+        assert await cached_fn(cache_write=False) == "v1"
+        assert await cached_fn(cache_write=False) == "v2"
+
+        assert await cached_fn() == "v3"  # populate through a normal call
+        clock.advance(15)
+        assert await cached_fn(cache_write=False) == "v3"  # stale served...
+        assert decorator._refreshing == {}  # ...but no refresh was started
+
+    async def test_disable_params_not_propagated(self, decorator):
+        async def fn():
+            return "value"
+
+        cached_fn = decorator(fn)
+
+        assert await cached_fn(cache_read=False, cache_write=False) == "value"
+
+    async def test_json_serializer_round_trip(self, clock):
+        cache = SimpleMemoryCache(serializer=JsonSerializer())
+        decorator = cached_swr(cache=cache, soft_ttl=10, hard_ttl=20, time_func=clock)
+        calls = 0
+
+        async def fn():
+            nonlocal calls
+            calls += 1
+            return {"version": calls}
+
+        cached_fn = decorator(fn)
+        assert await cached_fn() == {"version": 1}
+        assert await cached_fn() == {"version": 1}
+
+        clock.advance(15)
+        assert await cached_fn() == {"version": 1}  # stale payload deserializes too
+        await self.settle(decorator)
+        assert await cached_fn() == {"version": 2}
+
+    async def test_backend_ttl_matches_hard_ttl(self, decorator, cache, counter):
+        fn = counter()
+        cached_fn = decorator(fn)
+
+        await cached_fn()
+
+        handle = cache._handlers[cache.build_key(fn.__module__ + "fn()[]")]
+        assert 19 < handle.when() - asyncio.get_running_loop().time() <= 20
 
 
 class TestMultiCached:

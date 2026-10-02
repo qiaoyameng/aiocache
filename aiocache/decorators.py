@@ -2,6 +2,7 @@ import asyncio
 import functools
 import inspect
 import logging
+import time
 
 from aiocache.base import SENTINEL
 from aiocache.lock import RedLock
@@ -152,6 +153,167 @@ class cached_stampede(cached):
             await self.set_in_cache(key, result)
 
         return result
+
+
+class cached_swr(cached):
+    """
+    Caches the functions return value with a stale-while-revalidate strategy, so
+    that hot keys never make every concurrent caller wait for the slow function
+    at the same time when the entry expires.
+
+    Two deadlines are defined per entry:
+
+        - ``soft_ttl``: the freshness period. While fresh, the cached value is
+          returned directly. Once soft-expired, callers keep receiving the stale
+          value and a single background refresh is started per cache instance
+          and key (extra callers neither wait nor trigger more refreshes).
+        - ``hard_ttl``: the maximum time a value may be served. Once
+          hard-expired, callers must wait for a fresh result; if the refresh
+          fails the exception is propagated and the expired value is never
+          returned again. The entry is also stored in the backend with
+          ``ttl=hard_ttl`` so it is evicted once it becomes unusable.
+
+    Refresh coordination rules:
+
+        - Foreground callers waiting on a hard-expired key share the same
+          refresh; cancelling one waiter does not cancel the shared refresh
+          seen by the others.
+        - A refresh that raises (or is cancelled) releases the refresh slot, so
+          the next call retries instead of inheriting a dangling refresh.
+        - Call :meth:`close` when closing the cache to cancel and reap any
+          in-flight background refreshes (also available as
+          ``<function_name>.close``).
+
+    Call-time controls (keyword-only, not forwarded to the function):
+
+        - ``cache_read=False``: skip the cache lookup; the call is treated as a
+          hard miss (it shares/starts the refresh and stores the result when
+          ``cache_write`` is enabled).
+        - ``cache_write=False``: never store results and never start background
+          refreshes; a soft-expired entry is still served stale when read.
+        - ``aiocache_wait_for_write`` is accepted for signature compatibility
+          with :class:`cached` but has no effect: writes always happen inside
+          the shared refresh task.
+
+    Serialization rules: the stored payload is a
+    ``(value, soft_expiry, hard_expiry)`` tuple, so the cache serializer must
+    round-trip a 3-element tuple/list holding the value and two floats (or
+    ``None``). :class:`~aiocache.serializers.NullSerializer` (memory backend
+    default), :class:`~aiocache.serializers.PickleSerializer`,
+    :class:`~aiocache.serializers.JsonSerializer` and
+    :class:`~aiocache.serializers.MsgPackSerializer` all satisfy this (JSON and
+    msgpack read the tuple back as a list, which is handled);
+    :class:`~aiocache.serializers.StringSerializer` does not and must not be
+    used with this decorator.
+
+    The cache is available in the function object as ``<function_name>.cache``.
+
+    :param cache: cache instance to use when calling the ``set``/``get`` operations.
+    :param soft_ttl: int or float seconds the entry stays fresh. After that, the
+        stale value is served while a background refresh runs. Must be positive.
+    :param hard_ttl: int or float seconds after which the entry may no longer be
+        served and callers wait for a fresh result. Must be greater than
+        ``soft_ttl``. ``None`` (default) means entries never hard-expire.
+    :param time_func: callable returning the current time in seconds, used to
+        compute and compare the expiry deadlines. Defaults to ``time.time``;
+        inject a fake clock in tests to control expiration deterministically.
+    :param key_builder: Callable that allows to build the function dynamically. It receives
+        the function plus same args and kwargs passed to the function.
+        This behavior is necessarily different than ``BaseCache.build_key()``
+    :param skip_cache_func: Callable that receives the result after calling the
+        wrapped function and should return `True` if the value should skip the
+        cache (or `False` to store in the cache).
+        e.g. to avoid caching `None` results: `lambda r: r is None`
+    :param noself: bool if you are decorating a class function, by default self is also used to
+        generate the key. This will result in same function calls done by different class instances
+        to use different cache keys. Use noself=True if you want to ignore it.
+    """
+
+    def __init__(self, cache, *, soft_ttl, hard_ttl=None, time_func=time.time, **kwargs):
+        if soft_ttl <= 0:
+            raise ValueError("soft_ttl must be a positive number of seconds")
+        if hard_ttl is not None and hard_ttl <= soft_ttl:
+            raise ValueError("hard_ttl must be greater than soft_ttl")
+        super().__init__(cache, ttl=hard_ttl, **kwargs)
+        self.soft_ttl = soft_ttl
+        self.hard_ttl = hard_ttl
+        self.time_func = time_func
+        self._refreshing = {}
+
+    def __call__(self, f):
+        wrapper = super().__call__(f)
+        wrapper.close = self.close
+        return wrapper
+
+    async def decorator(
+        self, f, *args, cache_read=True, cache_write=True, aiocache_wait_for_write=True, **kwargs
+    ):
+        key = self.get_cache_key(f, args, kwargs)
+
+        if cache_read:
+            payload = await self.get_from_cache(key)
+            if payload is not None:
+                value, soft_expiry, hard_expiry = payload
+                now = self.time_func()
+                if hard_expiry is not None and now >= hard_expiry:
+                    pass  # too old to serve: fall through and wait for a fresh result
+                elif now >= soft_expiry:
+                    if cache_write:
+                        self._ensure_refresh(key, f, args, kwargs)
+                    return value
+                else:
+                    return value
+
+        if cache_write:
+            refresh = self._ensure_refresh(key, f, args, kwargs)
+            return await asyncio.shield(refresh)
+
+        return await f(*args, **kwargs)
+
+    def _ensure_refresh(self, key, f, args, kwargs):
+        task = self._refreshing.get(key)
+        if task is None or task.done():
+            task = asyncio.ensure_future(self._refresh(key, f, args, kwargs))
+            task.add_done_callback(functools.partial(self._reclaim_refresh, key))
+            self._refreshing[key] = task
+        return task
+
+    def _reclaim_refresh(self, key, task):
+        if self._refreshing.get(key) is task:
+            del self._refreshing[key]
+        if task.cancelled():
+            return
+        exc = task.exception()  # retrieve so it is never reported as unretrieved
+        if exc is not None:
+            logger.warning("Refresh of key %s failed", key, exc_info=exc)
+
+    async def _refresh(self, key, f, args, kwargs):
+        result = await f(*args, **kwargs)
+        if not self.skip_cache_func(result):
+            await self.set_in_cache(key, result)
+        return result
+
+    async def set_in_cache(self, key, value):
+        now = self.time_func()
+        hard_expiry = now + self.hard_ttl if self.hard_ttl is not None else None
+        payload = (value, now + self.soft_ttl, hard_expiry)
+        try:
+            await self.cache.set(key, payload, ttl=self.ttl)
+        except Exception:
+            logger.exception("Couldn't set %s in key %s, unexpected error", value, key)
+
+    async def close(self):
+        """
+        Cancel any in-flight background refreshes and wait for them to finish,
+        retrieving their outcomes. Call it when closing the cache so no refresh
+        task is left dangling; subsequent calls start from a clean state.
+        """
+        tasks = [task for task in self._refreshing.values() if not task.done()]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._refreshing.clear()
 
 
 def _get_args_dict(func, args, kwargs):

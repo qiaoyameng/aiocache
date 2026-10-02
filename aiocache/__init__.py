@@ -30,11 +30,12 @@ else:
     _AIOCACHE_CACHES.append(MemcachedCache)
     del aiomcache
 
-from .decorators import cached, cached_stampede, multi_cached  # noqa: E402,I202
+from .decorators import cached, cached_stampede, cached_swr, multi_cached  # noqa: E402,I202
 
 __all__ = (
     "cached",
     "cached_stampede",
+    "cached_swr",
     "multi_cached",
     *sorted(c.__name__ for c in _AIOCACHE_CACHES),
 )
