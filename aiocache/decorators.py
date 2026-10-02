@@ -1,12 +1,23 @@
 import asyncio
 import functools
 import inspect
+import json
 import logging
+import math
+import time
 
 from aiocache.base import SENTINEL
 from aiocache.lock import RedLock
 
 logger = logging.getLogger(__name__)
+
+_SWR_METADATA_PREFIX = "__aiocache_swr_metadata__:"
+
+
+class _StaleCacheEntry(Exception):
+    def __init__(self, value):
+        super().__init__("cache entry is stale but still usable")
+        self.value = value
 
 
 class cached:
@@ -152,6 +163,229 @@ class cached_stampede(cached):
             await self.set_in_cache(key, result)
 
         return result
+
+
+class cached_stale_while_revalidate(cached):
+    """
+    Serve stale values while refreshing one key in the background.
+
+    A value is fresh for ``ttl`` seconds. During the following
+    ``stale_ttl`` seconds it can still be returned, but the first request
+    starts one background refresh for that cache instance and key. Once the
+    hard deadline (``ttl + stale_ttl``) is reached, callers wait for a shared
+    refresh to produce a usable new value.
+
+    The configured cache serializer is used only for the cached return value.
+    SWR metadata is stored internally as JSON beside the value, so custom
+    serializers only need to round-trip the decorated function's result type.
+    Keys beginning with ``__aiocache_swr_metadata__:`` are reserved for that
+    metadata.
+
+    Extra injected arguments:
+
+        - ``cache_read``: When False, bypass the cache and call the wrapped
+          function directly.
+        - ``cache_write``: When False, do not start or wait for a refresh and
+          do not write or delete cache state. A stale value is still returned
+          if reading found one.
+        - ``aiocache_wait_for_write``: Applies only to the direct write done
+          when ``cache_read`` is False. Shared SWR refreshes always wait for
+          their write so waiters do not observe unfinished cache updates.
+
+    :param cache: cache instance to use.
+    :param ttl: seconds before the value becomes stale.
+    :param stale_ttl: additional seconds during which the stale value may be
+        served while a refresh runs.
+    :param key_builder: see :class:`cached`.
+    :param skip_cache_func: see :class:`cached`. Refresh results for which
+        this returns True are not stored and remove the old value/metadata.
+    :param noself: see :class:`cached`.
+    """
+
+    def __init__(
+        self,
+        cache,
+        *,
+        ttl,
+        stale_ttl=0,
+        key_builder=None,
+        skip_cache_func=lambda x: False,
+        noself=False,
+    ):
+        if not isinstance(ttl, (int, float)) or not math.isfinite(ttl) or ttl <= 0:
+            raise ValueError("ttl must be a positive number")
+        if (
+            not isinstance(stale_ttl, (int, float))
+            or not math.isfinite(stale_ttl)
+            or stale_ttl < 0
+        ):
+            raise ValueError("stale_ttl must be a non-negative number")
+
+        super().__init__(
+            cache,
+            ttl=ttl,
+            key_builder=key_builder,
+            skip_cache_func=skip_cache_func,
+            noself=noself,
+        )
+        self.fresh_ttl = float(ttl)
+        self.stale_ttl = float(stale_ttl)
+        self.hard_ttl = self.fresh_ttl + self.stale_ttl
+
+    async def decorator(
+        self, f, *args, cache_read=True, cache_write=True, aiocache_wait_for_write=True, **kwargs
+    ):
+        key = self.get_cache_key(f, args, kwargs)
+
+        if not cache_read:
+            result = await f(*args, **kwargs)
+            if cache_write:
+                if self.skip_cache_func(result):
+                    await self.delete_cached_entry(key)
+                elif aiocache_wait_for_write:
+                    await self.store_refresh(key, result)
+                else:
+                    asyncio.create_task(self.store_refresh(key, result))
+            return result
+
+        try:
+            value = await self.get_fresh_value(key)
+        except _StaleCacheEntry as stale:
+            if not cache_write:
+                return stale.value
+            self.get_or_start_refresh(key, f, args, kwargs)
+            return stale.value
+
+        if value is not SENTINEL:
+            return value
+
+        if not cache_write:
+            return await f(*args, **kwargs)
+
+        refresh = self.get_or_start_refresh(key, f, args, kwargs)
+        return await asyncio.shield(refresh)
+
+    async def get_fresh_value(self, key):
+        metadata = await self.get_metadata(key)
+        now = time.monotonic()
+        if metadata is None:
+            return SENTINEL
+
+        try:
+            value = await self.cache.get(key, default=SENTINEL)
+        except Exception:
+            logger.exception("Couldn't retrieve %s, unexpected error", key)
+            return SENTINEL
+        if value is SENTINEL:
+            return SENTINEL
+        if now < metadata["soft_expires_at"]:
+            return value
+        if now < metadata["hard_expires_at"]:
+            raise _StaleCacheEntry(value)
+        return SENTINEL
+
+    def get_or_start_refresh(self, key, f, args, kwargs):
+        registry = self.get_refresh_registry()
+        registry_key = self.cache.build_key(key)
+        current = registry.get(registry_key)
+        if current is not None and not current.done():
+            return current
+
+        task = asyncio.ensure_future(self.refresh(key, f, args, kwargs))
+        registry[registry_key] = task
+        task.add_done_callback(
+            lambda done: self._release_refresh(done, registry, registry_key)
+        )
+        return task
+
+    @staticmethod
+    def _release_refresh(task, registry, registry_key):
+        if registry.get(registry_key) is task:
+            registry.pop(registry_key, None)
+        if task.cancelled():
+            return
+        exception = task.exception()
+        if exception is not None:
+            logger.warning(
+                "SWR background refresh failed for %s",
+                registry_key,
+                exc_info=exception,
+            )
+
+    async def refresh(self, key, f, args, kwargs):
+        try:
+            result = await f(*args, **kwargs)
+            if self.skip_cache_func(result):
+                await self.delete_cached_entry(key)
+                return result
+            await self.store_refresh(key, result)
+            return result
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            await self.delete_cached_entry(key)
+            raise
+
+    async def store_refresh(self, key, result):
+        metadata_key = self.metadata_key(key)
+        try:
+            await self.cache.set(key, result, ttl=self.hard_ttl)
+            now = time.monotonic()
+            metadata = {
+                "soft_expires_at": now + self.fresh_ttl,
+                "hard_expires_at": now + self.hard_ttl,
+            }
+            await self.cache.set(
+                metadata_key,
+                metadata,
+                ttl=self.hard_ttl,
+                dumps_fn=json.dumps,
+            )
+        except Exception:
+            logger.exception("Couldn't refresh %s, unexpected error", key)
+            await self.delete_cached_entry(key)
+            raise
+
+    async def get_metadata(self, key):
+        try:
+            metadata = await self.cache.get(
+                self.metadata_key(key),
+                default=SENTINEL,
+                loads_fn=lambda value: None if value is None else json.loads(value),
+            )
+        except Exception:
+            logger.exception("Couldn't retrieve SWR metadata for %s", key)
+            return None
+
+        if metadata is SENTINEL or not isinstance(metadata, dict):
+            return None
+        soft_expires_at = metadata.get("soft_expires_at")
+        hard_expires_at = metadata.get("hard_expires_at")
+        if not isinstance(soft_expires_at, (int, float)) or not isinstance(
+            hard_expires_at, (int, float)
+        ):
+            return None
+        if not soft_expires_at <= hard_expires_at:
+            return None
+        return metadata
+
+    async def delete_cached_entry(self, key):
+        for candidate in (key, self.metadata_key(key)):
+            try:
+                await self.cache.delete(candidate)
+            except Exception:
+                logger.exception("Couldn't delete stale cache entry %s", candidate)
+
+    def get_refresh_registry(self):
+        registry = getattr(self.cache, "_aiocache_swr_refresh_tasks", None)
+        if registry is None:
+            registry = {}
+            self.cache._aiocache_swr_refresh_tasks = registry
+        return registry
+
+    @staticmethod
+    def metadata_key(key):
+        return f"{_SWR_METADATA_PREFIX}{key}"
 
 
 def _get_args_dict(func, args, kwargs):

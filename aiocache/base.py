@@ -6,7 +6,7 @@ import time
 from abc import ABC, abstractmethod
 from enum import Enum
 from types import TracebackType
-from typing import Callable, Generic, List, Optional, Set, TYPE_CHECKING, Type, TypeVar
+from typing import Any, Callable, Dict, Generic, List, Optional, Set, TYPE_CHECKING, Type, TypeVar
 
 from aiocache.serializers import StringSerializer
 
@@ -131,6 +131,7 @@ class BaseCache(Generic[CacheKeyType], ABC):
 
         self._serializer = serializer or StringSerializer()
         self._plugins = plugins or []
+        self._aiocache_swr_refresh_tasks: Dict[Any, "asyncio.Future[Any]"] = {}
 
     @property
     def serializer(self):
@@ -505,9 +506,18 @@ class BaseCache(Generic[CacheKeyType], ABC):
         :raises: :class:`asyncio.TimeoutError` if it lasts more than self.timeout
         """
         start = time.monotonic()
+        await self._cancel_stale_while_revalidate_tasks()
         ret = await self._close(*args, _conn=_conn, **kwargs)
         logger.debug("CLOSE (%.4f)s", time.monotonic() - start)
         return ret
+
+    async def _cancel_stale_while_revalidate_tasks(self):
+        tasks = list(self._aiocache_swr_refresh_tasks.values())
+        self._aiocache_swr_refresh_tasks.clear()
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _close(self, *args, **kwargs):
         pass

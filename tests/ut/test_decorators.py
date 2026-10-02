@@ -1,12 +1,13 @@
 import asyncio
 import inspect
+import json
 import random
 import sys
 from unittest.mock import ANY, create_autospec, patch
 
 import pytest
 
-from aiocache import cached, cached_stampede, multi_cached
+from aiocache import cached, cached_stale_while_revalidate, cached_stampede, multi_cached
 from aiocache.backends.memory import SimpleMemoryCache
 from aiocache.base import SENTINEL
 from aiocache.decorators import _get_args_dict
@@ -267,6 +268,275 @@ class TestCachedStampede:
                 "stub()[('value', 'value')]", "value", ttl=SENTINEL
             )
             assert stub.call_count == 1
+
+
+class TestCachedStaleWhileRevalidate:
+    @staticmethod
+    def patch_clock(mocker, current=0.0):
+        mocker.patch(
+            "aiocache.decorators.time.monotonic",
+            side_effect=lambda: current,
+        )
+
+        def set_current(value):
+            nonlocal current
+            current = value
+
+        return set_current
+
+    def test_invalid_ttl(self):
+        with pytest.raises(ValueError):
+            cached_stale_while_revalidate(SimpleMemoryCache(), ttl=0)
+
+    def test_invalid_stale_ttl(self):
+        with pytest.raises(ValueError):
+            cached_stale_while_revalidate(SimpleMemoryCache(), ttl=1, stale_ttl=-1)
+
+    def test_infinite_ttl_is_rejected(self):
+        with pytest.raises(ValueError):
+            cached_stale_while_revalidate(SimpleMemoryCache(), ttl=float("inf"))
+
+    async def test_fresh_stale_and_hard_periods(self, mocker):
+        set_time = self.patch_clock(mocker)
+        cache = SimpleMemoryCache()
+        calls = 0
+        starts = [asyncio.Event() for _ in range(3)]
+        blockers = [asyncio.Event(), asyncio.Event(), asyncio.Event()]
+        blockers[0].set()
+
+        @cached_stale_while_revalidate(cache, ttl=10, stale_ttl=10)
+        async def get_config():
+            nonlocal calls
+            calls += 1
+            starts[calls - 1].set()
+            await blockers[calls - 1].wait()
+            return f"v{calls}"
+
+        assert await get_config() == "v1"
+
+        set_time(5)
+        assert await get_config() == "v1"
+        assert calls == 1
+
+        set_time(15)
+        stale_request = asyncio.ensure_future(get_config())
+        await starts[1].wait()
+        assert await stale_request == "v1"
+        assert await get_config() == "v1"
+        assert calls == 2
+
+        refresh = next(iter(cache._aiocache_swr_refresh_tasks.values()))
+        blockers[1].set()
+        await asyncio.wait_for(refresh, timeout=1)
+        assert await get_config() == "v2"
+
+        set_time(40)
+        hard_request = asyncio.ensure_future(get_config())
+        await starts[2].wait()
+        hard_request_two = asyncio.ensure_future(get_config())
+        await asyncio.sleep(0)
+        assert not hard_request.done()
+        assert not hard_request_two.done()
+
+        blockers[2].set()
+        assert await asyncio.gather(hard_request, hard_request_two) == ["v3", "v3"]
+        assert calls == 3
+
+    async def test_hard_waiter_cancellation_does_not_cancel_shared_refresh(self, mocker):
+        set_time = self.patch_clock(mocker)
+        cache = SimpleMemoryCache()
+        start = asyncio.Event()
+        blocker = asyncio.Event()
+        calls = 0
+
+        @cached_stale_while_revalidate(cache, ttl=10, stale_ttl=10)
+        async def get_config():
+            nonlocal calls
+            calls += 1
+            start.set()
+            await blocker.wait()
+            return "new"
+
+        key = f"{get_config.__module__}get_config()[]"
+        metadata_key = f"__aiocache_swr_metadata__:{key}"
+        await cache.set(key, "old", ttl=20)
+        await cache.set(
+            metadata_key,
+            {"soft_expires_at": 10, "hard_expires_at": 20},
+            ttl=20,
+            dumps_fn=json.dumps,
+        )
+
+        set_time(25)
+        cancelled_waiter = asyncio.ensure_future(get_config())
+        await start.wait()
+        other_waiter = asyncio.ensure_future(get_config())
+        await asyncio.sleep(0)
+
+        cancelled_waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await cancelled_waiter
+
+        refresh = next(iter(cache._aiocache_swr_refresh_tasks.values()))
+        assert not refresh.cancelled()
+        blocker.set()
+        assert await other_waiter == "new"
+        assert calls == 1
+
+    async def test_background_failure_releases_slot_and_removes_stale_value(self, mocker):
+        set_time = self.patch_clock(mocker)
+        cache = SimpleMemoryCache()
+        calls = 0
+
+        @cached_stale_while_revalidate(cache, ttl=10, stale_ttl=10)
+        async def get_config():
+            nonlocal calls
+            calls += 1
+            if calls > 1:
+                raise RuntimeError("boom")
+            return "old"
+
+        assert await get_config() == "old"
+        set_time(15)
+
+        key = f"{get_config.__module__}get_config()[]"
+        metadata_key = f"__aiocache_swr_metadata__:{key}"
+        assert await get_config() == "old"
+        refresh = next(iter(cache._aiocache_swr_refresh_tasks.values()))
+        with pytest.raises(RuntimeError, match="boom"):
+            await refresh
+        assert cache._aiocache_swr_refresh_tasks == {}
+        assert await cache.get(key, default=SENTINEL) is SENTINEL
+        assert await cache.exists(metadata_key) is False
+
+        set_time(25)
+        with pytest.raises(RuntimeError, match="boom"):
+            await get_config()
+        assert calls == 3
+        assert cache._aiocache_swr_refresh_tasks == {}
+
+    async def test_close_cancels_refresh_and_next_use_starts_fresh_one(self, mocker):
+        set_time = self.patch_clock(mocker)
+        cache = SimpleMemoryCache()
+        calls = 0
+        starts = [asyncio.Event() for _ in range(3)]
+        blockers = [asyncio.Event(), asyncio.Event(), asyncio.Event()]
+        blockers[0].set()
+
+        @cached_stale_while_revalidate(cache, ttl=10, stale_ttl=10)
+        async def get_config():
+            nonlocal calls
+            calls += 1
+            starts[calls - 1].set()
+            await blockers[calls - 1].wait()
+            return f"v{calls}"
+
+        assert await get_config() == "v1"
+        set_time(15)
+        assert await get_config() == "v1"
+        await starts[1].wait()
+        old_refresh = next(iter(cache._aiocache_swr_refresh_tasks.values()))
+
+        await cache.close()
+        assert old_refresh.cancelled()
+        assert cache._aiocache_swr_refresh_tasks == {}
+
+        assert await get_config() == "v1"
+        await starts[2].wait()
+        new_refresh = next(iter(cache._aiocache_swr_refresh_tasks.values()))
+        assert new_refresh is not old_refresh
+        assert calls == 3
+
+        blockers[2].set()
+        await cache.close()
+
+    async def test_failed_refresh_exception_is_retrieved_by_waiter(self, mocker):
+        set_time = self.patch_clock(mocker)
+        cache = SimpleMemoryCache()
+        calls = 0
+
+        @cached_stale_while_revalidate(cache, ttl=10, stale_ttl=10)
+        async def get_config():
+            nonlocal calls
+            calls += 1
+            if calls > 1:
+                raise RuntimeError("boom")
+            return "old"
+
+        assert await get_config() == "old"
+        set_time(25)
+        with pytest.raises(RuntimeError, match="boom"):
+            await get_config()
+        assert calls == 2
+        assert cache._aiocache_swr_refresh_tasks == {}
+
+    async def test_cache_read_and_cache_write_rules(self, mocker):
+        set_time = self.patch_clock(mocker)
+        cache = SimpleMemoryCache()
+        calls = 0
+
+        @cached_stale_while_revalidate(cache, ttl=10, stale_ttl=10)
+        async def get_config():
+            nonlocal calls
+            calls += 1
+            return f"v{calls}"
+
+        assert await get_config() == "v1"
+        set_time(15)
+        assert await get_config(cache_write=False) == "v1"
+        await asyncio.sleep(0)
+        assert cache._aiocache_swr_refresh_tasks == {}
+        assert calls == 1
+
+        assert await get_config(cache_read=False) == "v2"
+        await asyncio.sleep(0)
+        set_time(5)
+        assert await get_config() == "v2"
+        assert calls == 2
+
+    async def test_skip_cache_result_removes_stale_entry(self, mocker):
+        set_time = self.patch_clock(mocker)
+        cache = SimpleMemoryCache()
+        calls = 0
+
+        @cached_stale_while_revalidate(
+            cache,
+            ttl=10,
+            stale_ttl=10,
+            skip_cache_func=lambda result: result is None,
+        )
+        async def get_config():
+            nonlocal calls
+            calls += 1
+            return None if calls > 1 else "old"
+
+        key = f"{get_config.__module__}get_config()[]"
+        metadata_key = f"__aiocache_swr_metadata__:{key}"
+        assert await get_config() == "old"
+        set_time(15)
+        assert await get_config() == "old"
+        refresh = next(iter(cache._aiocache_swr_refresh_tasks.values()))
+        assert await refresh is None
+        await asyncio.sleep(0)
+        assert await cache.get(key, default=SENTINEL) is SENTINEL
+        assert await cache.exists(metadata_key) is False
+
+    async def test_custom_serializer_is_used_only_for_value(self, mocker):
+        self.patch_clock(mocker)
+        from aiocache.serializers import JsonSerializer
+
+        cache = SimpleMemoryCache(serializer=JsonSerializer())
+
+        @cached_stale_while_revalidate(cache, ttl=10, stale_ttl=10)
+        async def get_config():
+            return {"enabled": True}
+
+        assert await get_config() == {"enabled": True}
+        key = get_config.__module__ + "get_config()[]"
+        raw_value = cache._cache[key]
+        raw_metadata = cache._cache[f"__aiocache_swr_metadata__:{key}"]
+        assert json.loads(raw_value) == {"enabled": True}
+        assert "soft_expires_at" in json.loads(raw_metadata)
 
 
 async def stub_dict(*args, keys=None, **kwargs):
