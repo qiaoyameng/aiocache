@@ -1,5 +1,6 @@
 import asyncio
 import inspect
+import os
 import random
 import sys
 from unittest.mock import ANY, create_autospec, patch
@@ -11,6 +12,7 @@ from aiocache.backends.memory import SimpleMemoryCache
 from aiocache.base import SENTINEL
 from aiocache.decorators import _get_args_dict
 from aiocache.lock import RedLock
+from aiocache.serializers import BaseSerializer, JsonSerializer, NullSerializer
 
 
 async def stub(*args, value=None, seconds=0, **kwargs):
@@ -18,6 +20,150 @@ async def stub(*args, value=None, seconds=0, **kwargs):
     if value:
         return str(value)
     return str(random.randint(1, 50))
+
+
+class CustomNoneSerializer(BaseSerializer):
+    def __init__(self):
+        super().__init__(encoding=None)
+        self.null_token = object()
+
+    def dumps(self, value):
+        return self.null_token if value is None else value
+
+    def loads(self, value):
+        return None if value is self.null_token else value
+
+
+@pytest.mark.parametrize(
+    "serializer",
+    (NullSerializer(), JsonSerializer(), CustomNoneSerializer()),
+)
+async def test_cached_cache_none_distinguishes_missing_and_cached_none(serializer):
+    cache = SimpleMemoryCache(serializer=serializer)
+    calls = {"none": 0, "missing": 0}
+
+    @cached(cache=cache, cache_none=True, ttl=1, key_builder=lambda f, value: value)
+    async def get_value(value):
+        calls[value] += 1
+        return None
+
+    assert await get_value("none") is None
+    assert await get_value("none") is None
+    assert calls["none"] == 1
+
+    missing_default = object()
+    assert await cache.get("missing", default=missing_default) is missing_default
+    assert await get_value("missing") is None
+    assert calls["missing"] == 1
+
+    ns_key = cache.build_key("none")
+    raw_value = await cache._get(ns_key, encoding=cache.serializer.encoding)
+    if isinstance(serializer, NullSerializer):
+        assert raw_value is None
+    elif isinstance(serializer, JsonSerializer):
+        assert raw_value == "null"
+    else:
+        assert raw_value is serializer.null_token
+
+    uncached_default = object()
+    assert await cache.multi_get(["none", "still-missing"], default=uncached_default) == [
+        None,
+        uncached_default,
+    ]
+    assert await cache.get("none") is None
+    assert await cache.get("still-missing", default=uncached_default) is uncached_default
+    await cache.close()
+
+
+async def test_cached_without_cache_none_keeps_missing_behavior():
+    cache = SimpleMemoryCache()
+    calls = 0
+
+    @cached(cache=cache, key_builder=lambda f: "none")
+    async def get_none():
+        nonlocal calls
+        calls += 1
+        return None
+
+    assert await get_none() is None
+    assert await get_none() is None
+    assert calls == 2
+    assert await cache.exists("none")
+    await cache.close()
+
+
+async def test_cached_cache_none_respects_skip_cache_func():
+    cache = SimpleMemoryCache()
+    calls = 0
+
+    @cached(cache=cache, cache_none=True, skip_cache_func=lambda result: result is None)
+    async def get_none():
+        nonlocal calls
+        calls += 1
+        return None
+
+    assert await get_none() is None
+    assert await get_none() is None
+    assert calls == 2
+    assert not await cache.exists(cached(cache=cache).get_cache_key(get_none, (), {}))
+    await cache.close()
+
+
+async def test_cached_cache_none_write_only_still_calls_function():
+    cache = SimpleMemoryCache()
+    calls = 0
+
+    @cached(cache=cache, cache_none=True, key_builder=lambda f: "none")
+    async def get_none():
+        nonlocal calls
+        calls += 1
+        return None
+
+    await get_none(cache_read=False)
+    await get_none(cache_read=False)
+
+    assert calls == 2
+    assert await cache.exists("none")
+    await cache.close()
+
+
+async def test_cached_cache_none_expires_and_calls_function_again():
+    cache = SimpleMemoryCache()
+    calls = 0
+
+    @cached(cache=cache, cache_none=True, ttl=0.05, key_builder=lambda f: "none")
+    async def get_none():
+        nonlocal calls
+        calls += 1
+        return None
+
+    assert await get_none() is None
+    assert await get_none() is None
+    assert calls == 1
+
+    await asyncio.sleep(0.06)
+
+    assert await get_none() is None
+    assert calls == 2
+    await cache.close()
+
+
+async def test_cached_cache_none_calls_function_when_cache_disabled():
+    cache = SimpleMemoryCache()
+    calls = 0
+
+    @cached(cache=cache, cache_none=True, key_builder=lambda f: "none")
+    async def get_none():
+        nonlocal calls
+        calls += 1
+        return None
+
+    with patch.dict(os.environ, {"AIOCACHE_DISABLE": "1"}):
+        assert await get_none() is None
+        assert await get_none() is None
+
+    assert calls == 2
+    await cache.close()
 
 
 class TestCached:
@@ -487,6 +633,79 @@ class TestMultiCached:
         cached_value = await f.cache.get(2)
         assert cached_value == 3
         assert not await f.cache.exists(1)
+
+
+@pytest.mark.parametrize(
+    "serializer",
+    (NullSerializer(), JsonSerializer(), CustomNoneSerializer()),
+)
+async def test_multi_cached_cache_none_reuses_cached_none(serializer):
+    cache = SimpleMemoryCache(serializer=serializer)
+    calls = []
+
+    @multi_cached(cache=cache, keys_from_attr="keys", cache_none=True)
+    async def get_values(keys):
+        calls.append(tuple(keys))
+        return {key: None for key in keys}
+
+    assert await get_values(keys=["a", "b"]) == {"a": None, "b": None}
+    assert await get_values(keys=["a", "b"]) == {"a": None, "b": None}
+    assert calls == [("a", "b")]
+
+    assert await get_values(keys=["a", "c"]) == {"a": None, "c": None}
+    assert calls == [("a", "b"), ("c",)]
+
+    await cache.close()
+
+
+async def test_multi_cached_without_cache_none_keeps_missing_behavior():
+    cache = SimpleMemoryCache()
+    calls = []
+
+    @multi_cached(cache=cache, keys_from_attr="keys")
+    async def get_values(keys):
+        calls.append(tuple(keys))
+        return {key: None for key in keys}
+
+    assert await get_values(keys=["a"]) == {"a": None}
+    assert await get_values(keys=["a"]) == {"a": None}
+    assert calls == [("a",), ("a",)]
+    assert await cache.exists("a")
+    await cache.close()
+
+
+async def test_multi_cached_cache_none_respects_skip_cache_func():
+    cache = SimpleMemoryCache()
+
+    @multi_cached(
+        cache=cache,
+        keys_from_attr="keys",
+        cache_none=True,
+        skip_cache_func=lambda _, value: value is None,
+    )
+    async def get_values(keys):
+        return {key: None for key in keys}
+
+    assert await get_values(keys=["a"]) == {"a": None}
+    assert not await cache.exists("a")
+    await cache.close()
+
+
+async def test_multi_cached_cache_none_write_only_uses_all_keys():
+    cache = SimpleMemoryCache()
+    calls = []
+
+    @multi_cached(cache=cache, keys_from_attr="keys", cache_none=True)
+    async def get_values(keys):
+        calls.append(tuple(keys))
+        return {key: None for key in keys}
+
+    await get_values(["a", "b"], cache_read=False)
+
+    assert calls == [("a", "b")]
+    assert await cache.exists("a")
+    assert await cache.exists("b")
+    await cache.close()
 
 
 def test_get_args_dict():

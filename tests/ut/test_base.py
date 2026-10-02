@@ -47,6 +47,15 @@ class TestAPI:
         with patch.dict(os.environ, {"AIOCACHE_DISABLE": "1"}):
             assert await dummy() == []
 
+    async def test_aiocache_enabled_disabled_returns_default(self):
+        @API.aiocache_enabled(fake_return=API._RETURN_DEFAULT)
+        async def dummy(*args, default=None, **kwargs):
+            """Dummy function."""
+
+        with patch.dict(os.environ, {"AIOCACHE_DISABLE": "1"}):
+            assert await dummy(default=1) == 1
+            assert await dummy() is None
+
     async def test_timeout_no_timeout(self):
         self = MagicMock(spec_set=("timeout",))
         self.timeout = 0
@@ -446,6 +455,7 @@ class TestCache:
             await mock_base_cache.get(Keys.KEY)
 
     async def test_get_default(self, mock_base_cache):
+        mock_base_cache._get.return_value = None
         mock_base_cache._serializer.loads.return_value = None
 
         assert await mock_base_cache.get(Keys.KEY, default=1) == 1

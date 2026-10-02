@@ -4,7 +4,7 @@ from unittest.mock import ANY, MagicMock, create_autospec, patch
 
 import pytest
 
-from aiocache.backends.memory import SimpleMemoryCache
+from aiocache.backends.memory import SimpleMemoryCache, _MISSING
 from aiocache.base import BaseCache
 from aiocache.serializers import NullSerializer, PickleSerializer
 from ...utils import Keys
@@ -26,6 +26,15 @@ class TestSimpleMemoryCache:
         mocker.spy(memory, "_get")
         await memory._gets(Keys.KEY)
         memory._get.assert_called_with(Keys.KEY, encoding="utf-8", _conn=ANY)
+
+    async def test_get_cached_none(self):
+        cache = SimpleMemoryCache()
+        await cache.set(Keys.KEY, None)
+        missing_default = object()
+
+        assert await cache.get(Keys.KEY) is None
+        assert await cache.get(Keys.KEY, default=missing_default) is None
+        assert await cache.exists(Keys.KEY)
 
     async def test_set(self, memory):
         await memory._set(Keys.KEY, "value")
@@ -65,6 +74,15 @@ class TestSimpleMemoryCache:
         await memory._multi_get([Keys.KEY, Keys.KEY_1])
         memory._cache.get.assert_any_call(Keys.KEY)
         memory._cache.get.assert_any_call(Keys.KEY_1)
+
+    async def test_multi_get_cached_none(self):
+        cache = SimpleMemoryCache()
+        await cache.set(Keys.KEY, None)
+        missing_default = object()
+
+        assert await cache.multi_get(
+            [Keys.KEY, Keys.KEY_1], default=missing_default
+        ) == [None, missing_default]
 
     async def test_multi_set(self, memory):
         await memory._multi_set([(Keys.KEY, "value"), (Keys.KEY_1, "random")])
@@ -131,12 +149,19 @@ class TestSimpleMemoryCache:
         await memory._delete(Keys.KEY)
         assert fake.cancel.call_count == 1
         assert Keys.KEY not in memory._handlers
-        memory._cache.pop.assert_called_with(Keys.KEY, None)
+        memory._cache.pop.assert_called_with(Keys.KEY, _MISSING)
 
     async def test_delete_missing(self, memory):
         memory._cache.pop.return_value = None
         await memory._delete(Keys.KEY)
-        memory._cache.pop.assert_called_with(Keys.KEY, None)
+        memory._cache.pop.assert_called_with(Keys.KEY, _MISSING)
+
+    async def test_delete_cached_none(self):
+        cache = SimpleMemoryCache()
+        await cache.set(Keys.KEY, None)
+
+        assert await cache.delete(Keys.KEY) == 1
+        assert not await cache.exists(Keys.KEY)
 
     async def test_delete_non_truthy(self, memory):
         non_truthy = MagicMock(spec_set=("__bool__",))
@@ -149,14 +174,14 @@ class TestSimpleMemoryCache:
         await memory._delete(Keys.KEY)
 
         assert non_truthy.__bool__.call_count == 1
-        memory._cache.pop.assert_called_with(Keys.KEY, None)
+        memory._cache.pop.assert_called_with(Keys.KEY, _MISSING)
 
     async def test_clear_namespace(self, memory):
         memory._cache.__iter__.return_value = iter(["nma", "nmb", "no"])
         await memory._clear("nm")
         assert memory._cache.pop.call_count == 2
-        memory._cache.pop.assert_any_call("nma", None)
-        memory._cache.pop.assert_any_call("nmb", None)
+        memory._cache.pop.assert_any_call("nma", _MISSING)
+        memory._cache.pop.assert_any_call("nmb", _MISSING)
 
     async def test_clear_no_namespace(self, memory):
         memory._handlers = "asdad"
@@ -178,7 +203,7 @@ class TestSimpleMemoryCache:
         memory._handlers[Keys.KEY] = fake
         assert await memory._redlock_release(Keys.KEY, "lock") == 1
         memory._cache.get.assert_called_with(Keys.KEY)
-        memory._cache.pop.assert_called_with(Keys.KEY, None)
+        memory._cache.pop.assert_called_with(Keys.KEY, _MISSING)
         assert fake.cancel.call_count == 1
         assert Keys.KEY not in memory._handlers
 

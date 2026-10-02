@@ -24,6 +24,7 @@ CacheKeyType = TypeVar("CacheKeyType")
 class API:
 
     CMDS: Set[Callable[..., object]] = set()
+    _RETURN_DEFAULT = object()
 
     @classmethod
     def register(cls, func):
@@ -66,6 +67,8 @@ class API:
             @functools.wraps(func)
             async def _enabled(*args, **kwargs):
                 if os.getenv("AIOCACHE_DISABLE") == "1":
+                    if fake_return is API._RETURN_DEFAULT:
+                        return kwargs.get("default")
                     return fake_return
                 return await func(*args, **kwargs)
 
@@ -185,7 +188,7 @@ class BaseCache(Generic[CacheKeyType], ABC):
         raise NotImplementedError()
 
     @API.register
-    @API.aiocache_enabled()
+    @API.aiocache_enabled(fake_return=API._RETURN_DEFAULT)
     @API.timeout
     @API.plugins
     async def get(self, key, default=None, loads_fn=None, namespace=None, _conn=None):
@@ -205,14 +208,24 @@ class BaseCache(Generic[CacheKeyType], ABC):
         loads = loads_fn or self.serializer.loads
         ns_key = self.build_key(key, namespace)
 
-        value = loads(await self._get(ns_key, encoding=self.serializer.encoding, _conn=_conn))
+        exists, raw_value = await self._get_with_presence(
+            ns_key, encoding=self.serializer.encoding, _conn=_conn
+        )
+        if not exists:
+            value = default
+        else:
+            value = loads(raw_value)
 
-        logger.debug("GET %s %s (%.4f)s", ns_key, value is not None, time.monotonic() - start)
-        return value if value is not None else default
+        logger.debug("GET %s %s (%.4f)s", ns_key, exists, time.monotonic() - start)
+        return value
 
     @abstractmethod
     async def _get(self, key, encoding, _conn=None):
         raise NotImplementedError()
+
+    async def _get_with_presence(self, key, encoding, _conn=None):
+        raw_value = await self._get(key, encoding=encoding, _conn=_conn)
+        return raw_value is not None, raw_value
 
     @abstractmethod
     async def _gets(self, key, encoding="utf-8", _conn=None):
@@ -222,13 +235,16 @@ class BaseCache(Generic[CacheKeyType], ABC):
     @API.aiocache_enabled(fake_return=[])
     @API.timeout
     @API.plugins
-    async def multi_get(self, keys, loads_fn=None, namespace=None, _conn=None):
+    async def multi_get(
+        self, keys, loads_fn=None, namespace=None, default=None, _conn=None
+    ):
         """
-        Get multiple values from the cache, values not found are Nones.
+        Get multiple values from the cache. Values not found return ``default``.
 
         :param keys: list of str
         :param loads_fn: callable alternative to use as loads function
         :param namespace: str alternative namespace to use
+        :param default: obj to return when a key is not found
         :param timeout: int or float in seconds specifying maximum timeout
             for the operations to last
         :returns: list of objs
@@ -238,12 +254,14 @@ class BaseCache(Generic[CacheKeyType], ABC):
         loads = loads_fn or self.serializer.loads
 
         ns_keys = [self.build_key(key, namespace) for key in keys]
-        values = [
-            loads(value)
-            for value in await self._multi_get(
-                ns_keys, encoding=self.serializer.encoding, _conn=_conn
-            )
-        ]
+        values = []
+        for exists, value in await self._multi_get_with_presence(
+            ns_keys, encoding=self.serializer.encoding, _conn=_conn
+        ):
+            if exists:
+                values.append(loads(value))
+            else:
+                values.append(default)
 
         logger.debug(
             "MULTI_GET %s %d (%.4f)s",
@@ -252,6 +270,10 @@ class BaseCache(Generic[CacheKeyType], ABC):
             time.monotonic() - start,
         )
         return values
+
+    async def _multi_get_with_presence(self, keys, encoding, _conn=None):
+        raw_values = await self._multi_get(keys, encoding=encoding, _conn=_conn)
+        return [(raw_value is not None, raw_value) for raw_value in raw_values]
 
     @abstractmethod
     async def _multi_get(self, keys, encoding, _conn=None):

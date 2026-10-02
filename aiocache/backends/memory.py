@@ -4,6 +4,8 @@ from typing import Optional, OrderedDict
 from aiocache.base import BaseCache
 from aiocache.serializers import NullSerializer
 
+_MISSING = object()
+
 
 class SimpleMemoryCache(BaseCache[str]):
     """
@@ -56,11 +58,23 @@ class SimpleMemoryCache(BaseCache[str]):
         self._mark_accessed(key)
         return self._cache.get(key)
 
+    async def _get_with_presence(self, key, encoding="utf-8", _conn=None):
+        value = self._cache.get(key, _MISSING)
+        if value is not _MISSING:
+            self._cache.move_to_end(key)
+        return value is not _MISSING, None if value is _MISSING else value
+
     async def _gets(self, key, encoding="utf-8", _conn=None):
         return await self._get(key, encoding=encoding, _conn=_conn)
 
     async def _multi_get(self, keys, encoding="utf-8", _conn=None):
         return [await self._get(key, encoding=encoding, _conn=_conn) for key in keys]
+
+    async def _multi_get_with_presence(self, keys, encoding="utf-8", _conn=None):
+        return [
+            await self._get_with_presence(key, encoding=encoding, _conn=_conn)
+            for key in keys
+        ]
 
     async def _set(self, key, value, ttl=None, _cas_token=None, _conn=None):
         if _cas_token is not None and self._cache.get(key) != _cas_token:
@@ -142,7 +156,7 @@ class SimpleMemoryCache(BaseCache[str]):
         return 0
 
     def __delete(self, key):
-        if self._cache.pop(key, None) is not None:
+        if self._cache.pop(key, _MISSING) is not _MISSING:
             handle = self._handlers.pop(key, None)
             if handle:
                 handle.cancel()

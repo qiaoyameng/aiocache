@@ -8,6 +8,8 @@ from aiocache.lock import RedLock
 
 logger = logging.getLogger(__name__)
 
+_MISSING = object()
+
 
 class cached:
     """
@@ -26,6 +28,7 @@ class cached:
     :param noself: bool if you are decorating a class function, by default self is also used to
         generate the key. This will result in same function calls done by different class instances
         to use different cache keys. Use noself=True if you want to ignore it.
+    :param cache_none: bool whether to cache and reuse ``None`` results. Defaults to False.
     """
 
     def __init__(
@@ -36,11 +39,13 @@ class cached:
         key_builder=None,
         skip_cache_func=lambda x: False,
         noself=False,
+        cache_none=False,
     ):
         self.ttl = ttl
         self.key_builder = key_builder
         self.skip_cache_func = skip_cache_func
         self.noself = noself
+        self.cache_none = cache_none
         self.cache = cache
 
     def __call__(self, f):
@@ -58,7 +63,7 @@ class cached:
 
         if cache_read:
             value = await self.get_from_cache(key)
-            if value is not None:
+            if not self._is_missing(value):
                 return value
 
         result = await f(*args, **kwargs)
@@ -91,11 +96,21 @@ class cached:
         )
 
     async def get_from_cache(self, key):
+        if not self.cache_none:
+            try:
+                return await self.cache.get(key)
+            except Exception:
+                logger.exception("Couldn't retrieve %s, unexpected error", key)
+                return None
+
         try:
-            return await self.cache.get(key)
+            return await self.cache.get(key, default=_MISSING)
         except Exception:
             logger.exception("Couldn't retrieve %s, unexpected error", key)
-        return None
+        return _MISSING
+
+    def _is_missing(self, value):
+        return value is _MISSING if self.cache_none else value is None
 
     async def set_in_cache(self, key, value):
         try:
@@ -136,12 +151,12 @@ class cached_stampede(cached):
         key = self.get_cache_key(f, args, kwargs)
 
         value = await self.get_from_cache(key)
-        if value is not None:
+        if not self._is_missing(value):
             return value
 
         async with RedLock(self.cache, key, self.lease):
             value = await self.get_from_cache(key)
-            if value is not None:
+            if not self._is_missing(value):
                 return value
 
             result = await f(*args, **kwargs)
@@ -211,6 +226,7 @@ class multi_cached:
         if that key-value pair should not be cached (or False to store in cache).
         The keys and values to be passed are taken from the wrapped function result.
     :param ttl: int seconds to store the keys. Default is 0 which means no expiration.
+    :param cache_none: bool whether to cache and reuse ``None`` values. Defaults to False.
     """
 
     def __init__(
@@ -221,12 +237,14 @@ class multi_cached:
         key_builder=None,
         skip_cache_func=lambda k, v: False,
         ttl=SENTINEL,
+        cache_none=False,
     ):
         self.cache = cache
         self.keys_from_attr = keys_from_attr
         self.key_builder = key_builder or (lambda key, f, *args, **kwargs: key)
         self.skip_cache_func = skip_cache_func
         self.ttl = ttl
+        self.cache_none = cache_none
 
     def __call__(self, f):
         @functools.wraps(f)
@@ -246,11 +264,11 @@ class multi_cached:
         if cache_read:
             values = await self.get_from_cache(*cache_keys)
             for orig_key, value in zip(orig_keys, values):
-                if value is None:
+                if self._is_missing(value):
                     missing_keys.append(orig_key)
                 else:
                     partial[orig_key] = value
-            if values and None not in values:
+            if values and all(not self._is_missing(value) for value in values):
                 return partial
         else:
             missing_keys = list(orig_keys)
@@ -293,12 +311,22 @@ class multi_cached:
     async def get_from_cache(self, *keys):
         if not keys:
             return []
+        if not self.cache_none:
+            try:
+                return await self.cache.multi_get(keys)
+            except Exception:
+                logger.exception("Couldn't retrieve %s, unexpected error", keys)
+                return [None] * len(keys)
+
         try:
-            values = await self.cache.multi_get(keys)
+            values = await self.cache.multi_get(keys, default=_MISSING)
             return values
         except Exception:
             logger.exception("Couldn't retrieve %s, unexpected error", keys)
-            return [None] * len(keys)
+            return [_MISSING] * len(keys)
+
+    def _is_missing(self, value):
+        return value is _MISSING if self.cache_none else value is None
 
     async def set_in_cache(self, result, fn, fn_args, fn_kwargs):
         try:
