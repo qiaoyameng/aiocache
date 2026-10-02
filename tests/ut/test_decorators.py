@@ -9,8 +9,9 @@ import pytest
 from aiocache import cached, cached_stampede, multi_cached
 from aiocache.backends.memory import SimpleMemoryCache
 from aiocache.base import SENTINEL
-from aiocache.decorators import _get_args_dict
+from aiocache.decorators import _CACHE_MISS, _get_args_dict
 from aiocache.lock import RedLock
+from aiocache.serializers import BaseSerializer, JsonSerializer, NullSerializer
 
 
 async def stub(*args, value=None, seconds=0, **kwargs):
@@ -495,3 +496,255 @@ def test_get_args_dict():
 
     args_dict = _get_args_dict(fn, ("a", "b", "c", "d"), {"what": "what"})
     assert args_dict == {"a": "a", "b": "b", "keys": None, "what": "what"}
+
+
+class TestCachedCacheNone:
+    @pytest.fixture
+    def decorator(self, mock_cache):
+        yield cached(cache=mock_cache, cache_none=True)
+
+    @pytest.fixture
+    def decorator_call(self, decorator):
+        yield decorator(stub)
+
+    @pytest.fixture(autouse=True)
+    def spy_stub(self, mocker):
+        module = sys.modules[globals()["__name__"]]
+        mocker.spy(module, "stub")
+
+    def test_init_defaults_to_disabled(self):
+        assert cached(cache=SimpleMemoryCache()).cache_none is False
+        assert cached_stampede(cache=SimpleMemoryCache()).cache_none is False
+        assert multi_cached(cache=SimpleMemoryCache(), keys_from_attr="k").cache_none is False
+
+    async def test_get_from_cache_hit_value(self, decorator):
+        decorator.cache.get.return_value = 1
+
+        assert await decorator.get_from_cache("key") == 1
+        decorator.cache.get.assert_called_with("key", default=_CACHE_MISS)
+        assert decorator.cache.exists.call_count == 0
+
+    async def test_get_from_cache_stored_none(self, decorator):
+        decorator.cache.get.return_value = _CACHE_MISS
+        decorator.cache.exists.return_value = True
+
+        assert await decorator.get_from_cache("key") is None
+
+    async def test_get_from_cache_missing(self, decorator):
+        decorator.cache.get.return_value = _CACHE_MISS
+        decorator.cache.exists.return_value = False
+
+        assert await decorator.get_from_cache("key") is _CACHE_MISS
+
+    async def test_get_from_cache_exception_is_a_miss(self, decorator):
+        decorator.cache.get.side_effect = Exception
+
+        assert await decorator.get_from_cache("key") is _CACHE_MISS
+
+    async def test_stored_none_short_circuits(self, decorator, decorator_call):
+        decorator.cache.get.return_value = _CACHE_MISS
+        decorator.cache.exists.return_value = True
+
+        assert await decorator_call() is None
+        assert stub.call_count == 0
+        assert decorator.cache.set.call_count == 0
+
+    async def test_missing_calls_function_and_caches(self, decorator, decorator_call):
+        decorator.cache.get.return_value = _CACHE_MISS
+        decorator.cache.exists.return_value = False
+
+        assert await decorator_call(value="value") == "value"
+        stub.assert_called_once_with(value="value")
+        decorator.cache.set.assert_called_once_with(
+            "stub()[('value', 'value')]", "value", ttl=SENTINEL
+        )
+
+    async def test_skip_cache_func_still_applies(self, mock_cache):
+        mock_cache.get.return_value = _CACHE_MISS
+        mock_cache.exists.return_value = False
+
+        @cached(cache=mock_cache, cache_none=True, skip_cache_func=lambda r: r is None)
+        async def fn():
+            return None
+
+        assert await fn() is None
+        assert mock_cache.set.call_count == 0
+
+    async def test_cache_read_disabled(self, decorator, decorator_call):
+        await decorator_call(cache_read=False, value="value")
+
+        assert decorator.cache.get.call_count == 0
+        assert decorator.cache.exists.call_count == 0
+        assert stub.call_count == 1
+
+    async def test_disabled_does_not_use_default_or_exists(self, mock_cache):
+        mock_cache.get.return_value = None
+
+        @cached(cache=mock_cache)
+        async def fn():
+            return 1
+
+        assert await fn() == 1
+        assert mock_cache.get.call_args.kwargs == {}
+        assert mock_cache.exists.call_count == 0
+
+    async def test_stampede_stored_none_short_circuits(self, mock_cache):
+        mock_cache.get.return_value = _CACHE_MISS
+        mock_cache.exists.return_value = True
+
+        @cached_stampede(cache=mock_cache, cache_none=True)
+        async def fn():
+            return 1
+
+        assert await fn() is None
+        assert mock_cache.set.call_count == 0
+
+
+class TestMultiCachedCacheNone:
+    @pytest.fixture
+    def decorator(self, mock_cache):
+        yield multi_cached(cache=mock_cache, keys_from_attr="keys", cache_none=True)
+
+    @pytest.fixture
+    def decorator_call(self, decorator):
+        yield decorator(stub_dict)
+
+    @pytest.fixture(autouse=True)
+    def spy_stub_dict(self, mocker):
+        module = sys.modules[globals()["__name__"]]
+        mocker.spy(module, "stub_dict")
+
+    async def test_get_from_cache_distinguishes_missing(self, decorator):
+        decorator.cache.multi_get.return_value = [None, None, 3]
+        decorator.cache.exists.side_effect = [True, False]
+
+        assert await decorator.get_from_cache("a", "b", "c") == [None, _CACHE_MISS, 3]
+
+    async def test_get_from_cache_no_none_skips_exists(self, decorator):
+        decorator.cache.multi_get.return_value = [1, 2]
+
+        assert await decorator.get_from_cache("a", "b") == [1, 2]
+        assert decorator.cache.exists.call_count == 0
+
+    async def test_get_from_cache_exception(self, decorator):
+        decorator.cache.multi_get.side_effect = Exception
+
+        assert await decorator.get_from_cache("a", "b") == [_CACHE_MISS, _CACHE_MISS]
+
+    async def test_full_hit_with_stored_nones(self, decorator, decorator_call):
+        decorator.cache.multi_get.return_value = [None, None]
+        decorator.cache.exists.return_value = True
+
+        assert await decorator_call(keys=["a", "b"]) == {"a": None, "b": None}
+        assert stub_dict.call_count == 0
+        assert decorator.cache.multi_set.call_count == 0
+
+    async def test_partial_hit_with_stored_none(self, decorator, decorator_call):
+        decorator.cache.multi_get.return_value = [None, None]
+        decorator.cache.exists.side_effect = [True, False]
+
+        result = await decorator_call(1, keys=["a", "b"], value="value")
+
+        stub_dict.assert_called_once_with(1, keys=["b"], value="value")
+        assert result["a"] is None
+        assert set(result) == {"a", "b"}
+
+    async def test_cache_read_disabled(self, decorator, decorator_call):
+        await decorator_call(keys=["a"], cache_read=False)
+
+        assert decorator.cache.multi_get.call_count == 0
+        assert decorator.cache.exists.call_count == 0
+        assert stub_dict.call_count == 1
+
+
+class NoneStringSerializer(BaseSerializer):
+    """Custom serializer round-tripping None through a placeholder string."""
+
+    def dumps(self, value):
+        return "NONE" if value is None else str(value)
+
+    def loads(self, value):
+        if value is None or value == "NONE":
+            return None
+        return value
+
+
+class TestCacheNoneWithSerializers:
+    @pytest.fixture(params=["null", "json", "custom"])
+    def none_cache(self, request):
+        serializer = {
+            "null": NullSerializer(),
+            "json": JsonSerializer(),
+            "custom": NoneStringSerializer(),
+        }[request.param]
+        return SimpleMemoryCache(serializer=serializer)
+
+    async def test_missing_key_calls_function(self, none_cache):
+        calls = 0
+
+        @cached(cache=none_cache, cache_none=True, ttl=10, key_builder=lambda f: "key")
+        async def fn():
+            nonlocal calls
+            calls += 1
+            return None
+
+        assert await fn() is None
+        assert calls == 1
+
+    async def test_stored_none_is_a_hit(self, none_cache):
+        calls = 0
+
+        @cached(cache=none_cache, cache_none=True, ttl=10, key_builder=lambda f: "key")
+        async def fn():
+            nonlocal calls
+            calls += 1
+            return None
+
+        await fn()
+        assert await fn() is None
+        assert calls == 1
+        assert await none_cache.exists("key")
+
+    async def test_cached_value_still_hits(self, none_cache):
+        calls = 0
+
+        @cached(cache=none_cache, cache_none=True, key_builder=lambda f: "key")
+        async def fn():
+            nonlocal calls
+            calls += 1
+            return "value"
+
+        assert await fn() == "value"
+        assert await fn() == "value"
+        assert calls == 1
+
+    async def test_multi_cached_result_keys_do_not_shrink(self, none_cache):
+        calls = []
+
+        @multi_cached(cache=none_cache, keys_from_attr="keys", cache_none=True, ttl=10)
+        async def fn(keys):
+            calls.append(list(keys))
+            return {key: None for key in keys}
+
+        assert await fn(keys=["a", "b"]) == {"a": None, "b": None}
+        assert await fn(keys=["a", "b"]) == {"a": None, "b": None}
+        assert calls == [["a", "b"]]
+
+        assert await fn(keys=["a", "c"]) == {"a": None, "c": None}
+        assert calls[-1] == ["c"]
+
+        assert set(await fn(keys=["a", "b", "c"])) == {"a", "b", "c"}
+        assert len(calls) == 2
+
+    async def test_multi_cached_mixed_none_and_values(self, none_cache):
+        calls = 0
+
+        @multi_cached(cache=none_cache, keys_from_attr="keys", cache_none=True)
+        async def fn(keys):
+            nonlocal calls
+            calls += 1
+            return {key: (None if key == "a" else key.upper()) for key in keys}
+
+        assert await fn(keys=["a", "b"]) == {"a": None, "b": "B"}
+        assert await fn(keys=["a", "b"]) == {"a": None, "b": "B"}
+        assert calls == 1
